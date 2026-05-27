@@ -57,4 +57,12 @@ pub enum ContractError {
     WithdrawalNotQueued = 47,
     /// Partial withdrawal amount exceeds the 50% cap.
     PartialWithdrawalExceedsCap = 48,
+    /// Borrower is within the slash immunity period.
+    BorrowerImmune = 49,
+    /// Slash record not found.
+    SlashRecordNotFound = 50,
+    /// Slash has already been reversed.
+    SlashAlreadyReversed = 51,
+    /// Loan was already fully repaid before slash recovery.
+    AlreadyRepaid = 52,
 }
