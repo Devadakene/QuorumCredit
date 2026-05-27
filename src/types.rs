@@ -116,6 +116,16 @@ pub enum LoanStatus {
     Defaulted,
 }
 
+/// Interest rate type for a loan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RateType {
+    /// Fixed rate locked at disbursement (yield_bps from Config).
+    Fixed,
+    /// Variable rate tied to an external index; recalculated on each repayment.
+    Variable,
+}
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -290,6 +300,11 @@ pub struct LoanRecord {
     /// Optional custom maturity date (ledger timestamp). When set, overrides the
     /// default `deadline` computed from `loan_duration`. `None` means use `deadline`.
     pub maturity_date: Option<u64>,
+    /// Interest rate type for this loan.
+    pub rate_type: RateType,
+    /// For variable-rate loans: the oracle key or index name used to look up the
+    /// current rate (e.g. `"SOFR"`, `"PRIME"`). `None` for fixed-rate loans.
+    pub index_reference: Option<soroban_sdk::String>,
 }
 
 /// A single payment event recorded against a loan.

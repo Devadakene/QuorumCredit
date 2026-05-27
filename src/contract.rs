@@ -1499,6 +1499,18 @@ impl QuorumCreditContract {
         loan::set_maturity_date(env, admin_signers, borrower, maturity_date)
     }
 
+    /// Set the interest rate type and optional index reference for an active loan. Admin-only.
+    /// Use `RateType::Variable` with a non-None `index_reference` for variable-rate loans.
+    pub fn set_loan_rate(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+        rate_type: RateType,
+        index_reference: Option<soroban_sdk::String>,
+    ) -> Result<(), ContractError> {
+        loan::set_loan_rate(env, admin_signers, borrower, rate_type, index_reference)
+    }
+
     /// Request a loan extension. Requires voucher approval.
     ///
     /// The borrower requests an extension of their active loan deadline. Vouchers must

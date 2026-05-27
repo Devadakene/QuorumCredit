@@ -7,6 +7,7 @@ use crate::reputation::ReputationNftExternalClient;
 use crate::types::{
     DataKey, LoanRecord, LoanStatus, VouchRecord, BPS_DENOMINATOR,
     DEFAULT_REFERRAL_BONUS_BPS, SLASH_ESCROW_PERIOD, MAX_DEFERMENT_PERIODS, DEFERMENT_PERIOD_SECS,
+    RateType,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -94,6 +95,8 @@ pub fn request_loan(
         risk_score: 0,
         deferment_periods: 0,
         maturity_date: None,
+        rate_type: crate::types::RateType::Fixed,
+        index_reference: None,
     };
 
     env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
@@ -415,6 +418,36 @@ pub fn set_maturity_date(
     env.events().publish(
         (symbol_short!(\"loan\"), symbol_short!(\"maturity\")),
         (borrower, maturity_date),
+    );
+
+    Ok(())
+}
+
+/// Set the interest rate type and optional index reference for an active loan. Admin-only.
+/// For variable-rate loans, `index_reference` names the oracle key (e.g. `"SOFR"`).
+/// For fixed-rate loans, `index_reference` should be `None`.
+pub fn set_loan_rate(
+    env: Env,
+    admin_signers: Vec<Address>,
+    borrower: Address,
+    rate_type: RateType,
+    index_reference: Option<soroban_sdk::String>,
+) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers)?;
+
+    if rate_type == RateType::Variable && index_reference.is_none() {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    loan.rate_type = rate_type;
+    loan.index_reference = index_reference;
+
+    env.storage().persistent().set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!(\"loan\"), symbol_short!(\"rate\")),
+        borrower,
     );
 
     Ok(())
