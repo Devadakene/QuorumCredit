@@ -170,8 +170,15 @@ pub enum DataKey {
     LargeLoanRequest(Address), // borrower → LargeLoanRequestRecord
     VouchGraph(Address, Address), // (voucher, borrower) → depth u32
     LoanCategoryLoans(LoanCategory), // category → Vec<loan_id>
-    // #650 Loan Securitization: security_id (u64) → Vec<loan_id>
-    SecurityLoans(u64),
+    // #634: Liquidity Mining
+    LastMiningClaim(Address),    // voucher → u64 timestamp of last mining reward claim
+    // #635: Vouch Snapshot for Governance
+    VouchSnapshot(u32),          // ledger_sequence → VouchSnapshotRecord
+    // #636: Staking Derivatives
+    StakingDerivative(Address, Address), // (voucher, borrower) → StakingDerivativeRecord
+    DerivativeTransfer(Address, Address, Address), // (from, to, borrower) → bool (pending transfer)
+    // #637: Fraud Detection
+    VoucherFraudScore(Address),  // voucher → u32 fraud score (0-100)
 }
 
 // ── Audit Log ─────────────────────────────────────────────────────────────────
@@ -244,6 +251,9 @@ pub struct Config {
     pub loan_duration: u64,
     pub max_loan_to_stake_ratio: u32,
     pub grace_period: u64,
+    /// #634: Liquidity mining reward rate in basis points (e.g. 100 = 1% per epoch).
+    /// Vouchers earn this rate on their staked amount per mining epoch.
+    pub liquidity_mining_rate_bps: u32,
 }
 
 // ── Per-Token Config ──────────────────────────────────────────────────────────
@@ -297,6 +307,8 @@ pub struct LoanRecord {
     pub amount: i128,        // total loan principal in stroops
     pub amount_repaid: i128, // cumulative repayments received so far (principal + yield)
     pub total_yield: i128,   // yield owed to vouchers, locked in at disbursement
+    pub yield_bps: i128,     // effective yield rate (risk-adjusted) at disbursement (#646)
+    pub slash_bps: i128,     // effective slash rate (risk-adjusted) at disbursement (#646)
     pub status: LoanStatus,
     pub created_at: u64,                   // ledger timestamp
     pub disbursement_timestamp: u64,       // ledger timestamp
@@ -305,14 +317,7 @@ pub struct LoanRecord {
     pub loan_purpose: soroban_sdk::String, // borrower-supplied purpose string
     pub loan_category: LoanCategory,       // category of the loan
     pub token_address: Address,            // token used for this loan
-    // #650 Loan Securitization: identifier when loan is bundled into a security
-    pub security_id: Option<u64>,
-    // #651 Loan Forbearance: timestamp until which payments are suspended
-    pub forbearance_end_date: Option<u64>,
-    // #649 Loan Subordination: repayment priority in multi-loan structures
-    pub priority_level: LoanPriority,
-    // #648 Milestone-Based Disbursement: tranche schedule (empty = single disbursement)
-    pub disbursement_schedule: Vec<Milestone>,
+    pub syndicate_id: Option<u64>,         // syndicate pool ID if syndicated (#647)
 }
 
 #[contracttype]
@@ -373,3 +378,55 @@ pub enum TimelockAction {
     Slash(Address),
     SetConfig(Config),
 }
+
+// ── #634: Liquidity Mining ────────────────────────────────────────────────────
+
+/// Epoch duration for liquidity mining rewards (7 days).
+pub const LIQUIDITY_MINING_EPOCH_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default liquidity mining rate: 50 bps = 0.5% per epoch.
+pub const DEFAULT_LIQUIDITY_MINING_RATE_BPS: u32 = 50;
+
+// ── #635: Vouch Snapshot ──────────────────────────────────────────────────────
+
+/// A snapshot of a borrower's total vouched stake at a given ledger sequence.
+/// Used for governance voting weight calculations.
+#[contracttype]
+#[derive(Clone)]
+pub struct VouchSnapshotEntry {
+    pub borrower: Address,
+    pub total_stake: i128,
+}
+
+/// All vouch snapshots captured at a given ledger sequence.
+#[contracttype]
+#[derive(Clone)]
+pub struct VouchSnapshotRecord {
+    pub ledger_sequence: u32,
+    pub timestamp: u64,
+    pub entries: Vec<VouchSnapshotEntry>,
+}
+
+// ── #636: Staking Derivatives ─────────────────────────────────────────────────
+
+/// Represents a derivative token minted by a voucher against their stake.
+/// The derivative can be transferred to enable secondary market trading.
+#[contracttype]
+#[derive(Clone)]
+pub struct StakingDerivativeRecord {
+    pub voucher: Address,       // original voucher who minted the derivative
+    pub borrower: Address,      // borrower whose vouch backs this derivative
+    pub stake_amount: i128,     // underlying stake amount in stroops
+    pub minted_at: u64,         // timestamp when derivative was minted
+    pub current_holder: Address, // current holder (may differ from original voucher after transfer)
+    pub is_active: bool,        // false once redeemed or underlying vouch withdrawn
+}
+
+// ── #637: Fraud Detection ─────────────────────────────────────────────────────
+
+/// Fraud score thresholds.
+pub const FRAUD_SCORE_HIGH_THRESHOLD: u32 = 70;
+pub const FRAUD_SCORE_MAX: u32 = 100;
+/// Weight per defaulted borrower backed (out of 100 total score).
+pub const FRAUD_SCORE_DEFAULT_WEIGHT: u32 = 20;
+/// Weight for vouching many borrowers simultaneously.
+pub const FRAUD_SCORE_CONCENTRATION_WEIGHT: u32 = 10;

@@ -7,14 +7,18 @@ use soroban_sdk::{
 pub mod admin;
 pub mod benchmarks;
 pub mod errors;
+pub mod fraud_detection;
 pub mod governance;
 pub mod health;
 pub mod helpers;
+pub mod liquidity_mining;
 pub mod loan;
 pub mod reputation;
+pub mod staking_derivatives;
 pub mod types;
 pub mod upgrade;
 pub mod vouch;
+pub mod vouch_snapshot;
 
 #[cfg(test)]
 mod admin_audit_log_test;
@@ -30,8 +34,6 @@ mod governance_token_voting_test;
 mod bug_condition_test;
 #[cfg(test)]
 mod borrower_whitelist_test;
-#[cfg(test)]
-mod bug_condition_test;
 #[cfg(test)]
 mod config_bps_test;
 #[cfg(test)]
@@ -94,6 +96,10 @@ mod initialize_admin_threshold_test;
 mod invariants_test;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod syndication_test;
+#[cfg(test)]
+mod default_prediction_test;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -138,6 +144,7 @@ impl QuorumCreditContract {
                 loan_duration: DEFAULT_LOAN_DURATION,
                 max_loan_to_stake_ratio: DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
                 grace_period: 0,
+                liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
             },
         );
 
@@ -241,8 +248,9 @@ impl QuorumCreditContract {
         threshold: i128,
         loan_purpose: soroban_sdk::String,
         token: Address,
+        syndicate_id: Option<u64>,
     ) -> Result<(), ContractError> {
-        loan::request_loan(env, borrower, amount, threshold, loan_purpose, token)
+        loan::request_loan(env, borrower, amount, threshold, loan_purpose, token, syndicate_id)
     }
 
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
@@ -284,57 +292,29 @@ impl QuorumCreditContract {
         loan::get_loans_by_category(env, category)
     }
 
-    // #650 Loan Securitization
-    pub fn set_security_id(
-        env: Env,
-        admin_signers: Vec<Address>,
-        loan_id: u64,
-        security_id: u64,
-    ) -> Result<(), ContractError> {
-        loan::set_security_id(env, admin_signers, loan_id, security_id)
+    /// #647: Get all loan IDs in a syndicate.
+    pub fn get_syndicate_loans(env: Env, syndicate_id: u64) -> Vec<u64> {
+        loan::get_syndicate_loans(env, syndicate_id)
     }
 
-    pub fn get_security_loans(env: Env, security_id: u64) -> Vec<u64> {
-        loan::get_security_loans(env, security_id)
+    /// #647: Create a new syndicate pool and return its ID.
+    pub fn create_syndicate(env: Env) -> u64 {
+        loan::create_syndicate(env)
     }
 
-    // #651 Loan Forbearance
-    pub fn request_forbearance(
-        env: Env,
-        admin_signers: Vec<Address>,
-        borrower: Address,
-        end_timestamp: u64,
-    ) -> Result<(), ContractError> {
-        loan::request_forbearance(env, admin_signers, borrower, end_timestamp)
+    /// #646: Get the risk score for a borrower (0..10_000).
+    pub fn get_risk_score(env: Env, borrower: Address) -> i128 {
+        loan::get_risk_score(env, borrower)
     }
 
-    // #649 Loan Subordination
-    pub fn set_priority_level(
-        env: Env,
-        admin_signers: Vec<Address>,
-        loan_id: u64,
-        priority: LoanPriority,
-    ) -> Result<(), ContractError> {
-        loan::set_priority_level(env, admin_signers, loan_id, priority)
+    /// #646: Preview the dynamic yield rate (bps) for a borrower based on their history.
+    pub fn get_dynamic_yield_bps(env: Env, borrower: Address) -> i128 {
+        loan::get_dynamic_yield_bps(env, borrower)
     }
 
-    // #648 Milestone-Based Disbursement
-    pub fn add_disbursement_milestone(
-        env: Env,
-        admin_signers: Vec<Address>,
-        loan_id: u64,
-        amount: i128,
-        release_timestamp: u64,
-    ) -> Result<(), ContractError> {
-        loan::add_disbursement_milestone(env, admin_signers, loan_id, amount, release_timestamp)
-    }
-
-    pub fn release_milestone(
-        env: Env,
-        loan_id: u64,
-        milestone_index: u32,
-    ) -> Result<(), ContractError> {
-        loan::release_milestone(env, loan_id, milestone_index)
+    /// #646: Preview the dynamic slash rate (bps) for a borrower based on their history.
+    pub fn get_dynamic_slash_bps(env: Env, borrower: Address) -> i128 {
+        loan::get_dynamic_slash_bps(env, borrower)
     }
 
     // ── Admin Functions (require admin_threshold signatures) ──────────────────
@@ -892,5 +872,71 @@ impl QuorumCreditContract {
 
     pub fn validate_upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), ContractError> {
         upgrade::validate_upgrade(&env, new_wasm_hash)
+    }
+
+    // ── #634: Liquidity Mining ────────────────────────────────────────────────
+
+    pub fn claim_liquidity_mining_reward(env: Env, voucher: Address) -> Result<i128, ContractError> {
+        liquidity_mining::claim_liquidity_mining_reward(env, voucher)
+    }
+
+    pub fn get_pending_mining_reward(env: Env, voucher: Address) -> i128 {
+        liquidity_mining::get_pending_mining_reward(env, voucher)
+    }
+
+    // ── #635: Vouch Snapshot for Governance ──────────────────────────────────
+
+    pub fn take_vouch_snapshot(env: Env, caller: Address) -> Result<u32, ContractError> {
+        vouch_snapshot::take_vouch_snapshot(env, caller)
+    }
+
+    pub fn get_vouch_snapshot(env: Env, ledger_sequence: u32) -> Option<VouchSnapshotRecord> {
+        vouch_snapshot::get_vouch_snapshot(env, ledger_sequence)
+    }
+
+    pub fn get_snapshot_stake(env: Env, ledger_sequence: u32, borrower: Address) -> i128 {
+        vouch_snapshot::get_snapshot_stake(env, ledger_sequence, borrower)
+    }
+
+    // ── #636: Staking Derivatives ─────────────────────────────────────────────
+
+    pub fn mint_staking_derivative(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        staking_derivatives::mint_staking_derivative(env, voucher, borrower)
+    }
+
+    pub fn transfer_staking_derivative(
+        env: Env,
+        from: Address,
+        to: Address,
+        original_voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        staking_derivatives::transfer_staking_derivative(env, from, to, original_voucher, borrower)
+    }
+
+    pub fn get_staking_derivative(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Option<StakingDerivativeRecord> {
+        staking_derivatives::get_staking_derivative(env, voucher, borrower)
+    }
+
+    // ── #637: Fraud Detection ─────────────────────────────────────────────────
+
+    pub fn calculate_fraud_score(env: Env, voucher: Address) -> u32 {
+        fraud_detection::calculate_fraud_score(env, voucher)
+    }
+
+    pub fn get_fraud_score(env: Env, voucher: Address) -> u32 {
+        fraud_detection::get_fraud_score(env, voucher)
+    }
+
+    pub fn is_high_fraud_risk(env: Env, voucher: Address) -> bool {
+        fraud_detection::is_high_fraud_risk(env, voucher)
     }
 }
