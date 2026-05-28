@@ -25,6 +25,10 @@ mod emergency_pause_test;
 mod withdrawal_queue_test;
 #[cfg(test)]
 mod cross_chain_vouch_test;
+#[cfg(test)]
+mod dynamic_slash_threshold_test;
+#[cfg(test)]
+mod loan_size_slash_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
@@ -73,6 +77,9 @@ impl QuorumCreditContract {
                 voting_period_seconds: DEFAULT_VOTING_PERIOD_SECONDS,
                 slash_cooldown_seconds: 0,
                 emergency_pause_enabled: false,
+                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
+                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
+                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
             },
         );
 
