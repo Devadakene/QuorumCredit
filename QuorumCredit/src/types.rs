@@ -349,6 +349,7 @@ pub struct VouchRecord {
     pub amount: i128,         // in stroops
     pub vouch_timestamp: u64, // ledger timestamp when vouch was created; immutable after set
     pub token: Address,       // token this stake is denominated in
+    pub sector: soroban_sdk::String, // #642: sector/region of the voucher for diversification
 }
 
 #[contracttype]

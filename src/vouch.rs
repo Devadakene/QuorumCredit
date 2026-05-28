@@ -2,7 +2,7 @@ extern crate alloc;
 
 use crate::errors::ContractError;
 use crate::helpers::{
-    has_active_loan, require_allowed_token, require_not_paused, require_positive_amount,
+    has_active_loan, require_admin_approval, require_allowed_token, require_not_paused, require_positive_amount,
 };
 use crate::types::{
     BridgeRecord, DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord,
@@ -52,8 +52,45 @@ pub fn vouch(
     token: Address,
     chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
+    vouch_with_chain(env, voucher, borrower, stake, token, 0)
+}
+
+/// Vouch with cross-chain support. chain_id=0 means native Stellar.
+/// For non-zero chain_id, the voucher must have been bridge-validated first.
+pub fn vouch_cross_chain(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+    stake: i128,
+    token: Address,
+    chain_id: u32,
+) -> Result<(), ContractError> {
+    vouch_with_chain(env, voucher, borrower, stake, token, chain_id)
+}
+
+fn vouch_with_chain(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+    stake: i128,
+    token: Address,
+    chain_id: u32,
+) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
+
+    // Bridge validation: non-native chain vouches require prior bridge validation
+    if chain_id != 0 {
+        let validated: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BridgeValidated(voucher.clone(), chain_id))
+            .unwrap_or(false);
+        if !validated {
+            return Err(ContractError::BridgeNotValidated);
+        }
+    }
+
     let cfg = VouchConfig::load(&env);
     do_vouch(&env, &cfg, voucher, borrower, stake, token, chain_id)
 }
@@ -151,6 +188,7 @@ fn commit_vouch(
     borrower: Address,
     stake: i128,
     token: Address,
+    chain_id: u32,
     mut vouches: Vec<VouchRecord>,
     chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
@@ -240,7 +278,7 @@ fn do_vouch(
 ) -> Result<(), ContractError> {
     crate::helpers::register_borrower_if_needed(env, &borrower);
     let (token_client, vouches) = validate_vouch(env, cfg, &voucher, &borrower, stake, &token)?;
-    commit_vouch(env, &token_client, voucher, borrower, stake, token, vouches)
+    commit_vouch(env, &token_client, voucher, borrower, stake, token, chain_id, vouches)
 }
 
 pub fn batch_vouch(

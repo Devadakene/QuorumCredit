@@ -605,6 +605,20 @@ pub struct VoucherStats {
     pub total_slashed: i128,
 }
 
+// ── Issue #635: Vouch Snapshot ────────────────────────────────────────────────
+
+/// A single entry in a governance vouch snapshot.
+#[contracttype]
+#[derive(Clone)]
+pub struct VouchSnapshotEntry {
+    /// The borrower whose vouches are snapshotted.
+    pub borrower: Address,
+    /// Total stake vouched for this borrower at snapshot time, in stroops.
+    pub total_stake: i128,
+    /// Number of active vouchers at snapshot time.
+    pub voucher_count: u32,
+}
+
 // ── Pause Mode ────────────────────────────────────────────────────────────────
 
 #[contracttype]

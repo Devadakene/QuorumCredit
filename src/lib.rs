@@ -90,6 +90,35 @@ impl QuorumCreditContract {
         vouch::vouch(env, voucher, borrower, stake, token, chain_id)
     }
 
+    /// Issue #632: Vouch with cross-chain support.
+    /// chain_id=0 is native Stellar; non-zero requires prior bridge validation.
+    pub fn vouch_cross_chain(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        stake: i128,
+        token: Address,
+        chain_id: u32,
+    ) -> Result<(), ContractError> {
+        vouch::vouch_cross_chain(env, voucher, borrower, stake, token, chain_id)
+    }
+
+    /// Issue #632: Admin sets bridge validation status for a voucher on a given chain.
+    pub fn set_bridge_validated(
+        env: Env,
+        admin_signers: Vec<Address>,
+        voucher: Address,
+        chain_id: u32,
+        validated: bool,
+    ) -> Result<(), ContractError> {
+        vouch::set_bridge_validated(env, admin_signers, voucher, chain_id, validated)
+    }
+
+    /// Issue #632: Query bridge validation status.
+    pub fn is_bridge_validated(env: Env, voucher: Address, chain_id: u32) -> bool {
+        vouch::is_bridge_validated(env, voucher, chain_id)
+    }
+
     pub fn batch_vouch(
         env: Env,
         voucher: Address,
@@ -404,15 +433,37 @@ impl QuorumCreditContract {
                 if v.token != loan.token_address {
                     continue;
                 }
-                let yield_share = if total_stake > 0 {
+                // Issue #633: Yield tiering — vouch age bonus.
+                // Vouches older than 30 days get +50% of their yield share.
+                // Vouches older than 7 days get +25% of their yield share.
+                let vouch_age_secs = loan.disbursement_timestamp.saturating_sub(v.vouch_timestamp);
+                let age_multiplier_bps: i128 = if vouch_age_secs >= 30 * 24 * 60 * 60 {
+                    15_000 // 150%
+                } else if vouch_age_secs >= 7 * 24 * 60 * 60 {
+                    12_500 // 125%
+                } else {
+                    10_000 // 100% base
+                };
+
+                let base_yield_share = if total_stake > 0 {
                     loan.total_yield * v.stake / total_stake
                 } else {
                     0
                 };
+                let tiered_yield = base_yield_share * age_multiplier_bps / 10_000;
+
+                // Issue #634: Liquidity mining reward on top of yield.
+                let cfg = config(&env);
+                let mining_reward = if cfg.liquidity_mining_rate_bps > 0 {
+                    v.stake * cfg.liquidity_mining_rate_bps / 10_000
+                } else {
+                    0
+                };
+
                 token_client.transfer(
                     &env.current_contract_address(),
                     &v.voucher,
-                    &(v.stake + yield_share),
+                    &(v.stake + tiered_yield + mining_reward),
                 );
             }
 

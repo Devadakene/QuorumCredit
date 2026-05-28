@@ -167,6 +167,18 @@ impl QuorumCreditContract {
         vouch::vouch(env, voucher, borrower, stake, token)
     }
 
+    // #642: vouch with sector for diversification enforcement
+    pub fn vouch_with_sector(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        stake: i128,
+        token: Address,
+        sector: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        vouch::vouch_with_sector(env, voucher, borrower, stake, token, sector)
+    }
+
     pub fn batch_vouch(
         env: Env,
         voucher: Address,
