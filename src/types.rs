@@ -78,6 +78,12 @@ pub const DECREASE_STAKE_TIMELOCK: u64 = 7 * 24 * 60 * 60;
 /// Withdrawal request timelock delay, in seconds (24 hours).
 pub const WITHDRAWAL_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
 
+/// Maximum number of deferment periods allowed per loan.
+pub const MAX_DEFERMENT_PERIODS: u32 = 3;
+
+/// Duration of each deferment period, in seconds (30 days).
+pub const DEFERMENT_PERIOD_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Penalty applied to partial mid-loan withdrawals, in basis points (1000 = 10%).
 pub const PARTIAL_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
 
@@ -117,6 +123,16 @@ pub enum LoanStatus {
     Active,
     Repaid,
     Defaulted,
+}
+
+/// Interest rate type for a loan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RateType {
+    /// Fixed rate locked at disbursement (yield_bps from Config).
+    Fixed,
+    /// Variable rate tied to an external index; recalculated on each repayment.
+    Variable,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -344,6 +360,16 @@ pub struct LoanRecord {
     pub reminder_sent: bool,
     /// Risk score for the borrower (0-100), used for dynamic yield calculation.
     pub risk_score: u32,
+    /// Number of payment deferment periods used on this loan.
+    pub deferment_periods: u32,
+    /// Optional custom maturity date (ledger timestamp). When set, overrides the
+    /// default `deadline` computed from `loan_duration`. `None` means use `deadline`.
+    pub maturity_date: Option<u64>,
+    /// Interest rate type for this loan.
+    pub rate_type: RateType,
+    /// For variable-rate loans: the oracle key or index name used to look up the
+    /// current rate (e.g. `"SOFR"`, `"PRIME"`). `None` for fixed-rate loans.
+    pub index_reference: Option<soroban_sdk::String>,
 }
 
 /// A single payment event recorded against a loan.
