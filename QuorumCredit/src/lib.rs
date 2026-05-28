@@ -14,6 +14,7 @@ pub mod helpers;
 pub mod liquidity_mining;
 pub mod loan;
 pub mod reputation;
+pub mod secure_delete;
 pub mod staking_derivatives;
 pub mod types;
 pub mod upgrade;
