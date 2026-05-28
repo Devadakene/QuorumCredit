@@ -108,6 +108,8 @@ mod governance_veto_test;
 mod loan_health_test;
 #[cfg(test)]
 mod vouch_global_cooldown_test;
+#[cfg(test)]
+mod stake_decay_test;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -154,6 +156,8 @@ impl QuorumCreditContract {
                 grace_period: 0,
                 liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
                 veto_admin: None,
+                decay_rate_bps: 0,
+                decay_period_secs: 0,
             },
         );
 
@@ -222,6 +226,15 @@ impl QuorumCreditContract {
         borrower: Address,
     ) -> Result<(), ContractError> {
         vouch::withdraw_vouch(env, voucher, borrower)
+    }
+
+    /// Reset the decay clock on an existing vouch by updating its timestamp to now.
+    pub fn refresh_vouch(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        vouch::refresh_vouch(env, voucher, borrower)
     }
 
     pub fn transfer_vouch(

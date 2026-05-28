@@ -262,6 +262,45 @@ pub fn bps_of(amount: i128, bps: i128) -> i128 {
     amount * bps / 10_000
 }
 
+/// Compute the effective (decayed) stake for a vouch.
+///
+/// If `decay_rate_bps == 0` or `decay_period_secs == 0` decay is disabled and
+/// the original `stake` is returned unchanged.
+///
+/// Otherwise, for each full `decay_period_secs` elapsed since `vouch_timestamp`,
+/// the stake is reduced by `decay_rate_bps / 10_000`. The minimum returned value
+/// is 0 (stake never goes negative).
+///
+/// Example: stake=1_000_000, decay_rate_bps=100 (1%), decay_period_secs=30 days.
+/// After 1 period → 990_000. After 2 periods → 980_100. Etc.
+pub fn compute_decayed_stake(
+    stake: i128,
+    vouch_timestamp: u64,
+    now: u64,
+    decay_rate_bps: u32,
+    decay_period_secs: u64,
+) -> i128 {
+    if decay_rate_bps == 0 || decay_period_secs == 0 || now <= vouch_timestamp {
+        return stake;
+    }
+    let elapsed = now - vouch_timestamp;
+    let periods = elapsed / decay_period_secs;
+    if periods == 0 {
+        return stake;
+    }
+    // Apply compound decay: stake * ((10_000 - decay_rate_bps) / 10_000) ^ periods
+    // Use integer arithmetic: multiply by (10_000 - rate) and divide by 10_000 each period.
+    let keep_bps = (10_000u64 - decay_rate_bps as u64) as i128;
+    let mut result = stake;
+    for _ in 0..periods {
+        result = result * keep_bps / 10_000;
+        if result <= 0 {
+            return 0;
+        }
+    }
+    result
+}
+
 pub fn validate_admin_config(
     env: &Env,
     admins: &Vec<Address>,

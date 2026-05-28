@@ -356,6 +356,12 @@ pub struct Config {
     pub liquidity_mining_rate_bps: u32,
     /// #685: Veto admin address; can veto governance proposals before execution.
     pub veto_admin: Option<Address>,
+    /// Optional stake decay rate in basis points per decay_period_secs.
+    /// 0 = decay disabled. E.g. 100 bps = 1% decay per period.
+    pub decay_rate_bps: u32,
+    /// Period in seconds over which decay_rate_bps is applied.
+    /// 0 = decay disabled. E.g. 30 * 24 * 60 * 60 = 30 days.
+    pub decay_period_secs: u64,
 }
 
 // ── Per-Token Config ──────────────────────────────────────────────────────────

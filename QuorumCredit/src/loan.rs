@@ -437,7 +437,18 @@ pub fn is_eligible(env: Env, borrower: Address, threshold: i128) -> bool {
         .persistent()
         .get(&DataKey::Vouches(borrower))
         .unwrap_or(Vec::new(&env));
-    let total_stake: i128 = vouches.iter().map(|v| v.amount).sum();
+    let cfg = crate::helpers::config(&env);
+    let now = env.ledger().timestamp();
+    let total_stake: i128 = vouches
+        .iter()
+        .map(|v| crate::helpers::compute_decayed_stake(
+            v.amount,
+            v.vouch_timestamp,
+            now,
+            cfg.decay_rate_bps,
+            cfg.decay_period_secs,
+        ))
+        .sum();
     total_stake >= threshold
 }
 

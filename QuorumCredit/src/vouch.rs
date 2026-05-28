@@ -541,10 +541,20 @@ pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError>
         .get::<DataKey, Vec<VouchRecord>>(&DataKey::Vouches(borrower))
         .unwrap_or(Vec::new(&env));
 
+    let cfg = crate::helpers::config(&env);
+    let now = env.ledger().timestamp();
+
     let mut total: i128 = 0;
     for vouch in vouches.iter() {
+        let effective = crate::helpers::compute_decayed_stake(
+            vouch.amount,
+            vouch.vouch_timestamp,
+            now,
+            cfg.decay_rate_bps,
+            cfg.decay_period_secs,
+        );
         total = total
-            .checked_add(vouch.amount)
+            .checked_add(effective)
             .ok_or(ContractError::StakeOverflow)?;
     }
 
@@ -556,6 +566,45 @@ pub fn voucher_history(env: Env, voucher: Address) -> Vec<Address> {
         .persistent()
         .get(&DataKey::VoucherHistory(voucher))
         .unwrap_or(Vec::new(&env))
+}
+
+/// Reset the `vouch_timestamp` on an existing vouch to the current ledger time,
+/// restarting the decay clock. The voucher must sign the transaction.
+/// Cannot be called while the borrower has an active loan.
+pub fn refresh_vouch(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    let mut vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .ok_or(ContractError::NoVouchesForBorrower)?;
+
+    let idx = vouches
+        .iter()
+        .position(|v| v.voucher == voucher)
+        .ok_or(ContractError::VoucherNotFound)? as u32;
+
+    let mut record = vouches.get(idx).unwrap();
+    record.vouch_timestamp = env.ledger().timestamp();
+    vouches.set(idx, record);
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Vouches(borrower.clone()), &vouches);
+    extend_ttl(&env, &DataKey::Vouches(borrower.clone()));
+
+    env.events().publish(
+        (symbol_short!("vouch"), symbol_short!("refresh")),
+        (voucher, borrower),
+    );
+
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
