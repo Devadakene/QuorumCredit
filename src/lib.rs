@@ -73,6 +73,14 @@ impl QuorumCreditContract {
                 voting_period_seconds: DEFAULT_VOTING_PERIOD_SECONDS,
                 slash_cooldown_seconds: 0,
                 emergency_pause_enabled: false,
+                recovery_percentage: 0,
+                redistribution_rule: RedistributionRule::Treasury,
+                immunity_period_seconds: 0,
+                insurance_premium_bps: 0,
+                slash_delay_seconds: DEFAULT_SLASH_DELAY_SECONDS,
+                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
+                early_repayment_discount_bps: 0,
+                oracle_address: None,
             },
         );
 
@@ -240,6 +248,8 @@ impl QuorumCreditContract {
             maturity_date: None,
             rate_type: crate::types::RateType::Fixed,
             index_reference: None,
+            escrow_status: crate::types::EscrowStatus::None,
+            retry_count: 0,
         };
 
         env.storage()
@@ -455,7 +465,7 @@ impl QuorumCreditContract {
                 // Issue #634: Liquidity mining reward on top of yield.
                 let cfg = config(&env);
                 let mining_reward = if cfg.liquidity_mining_rate_bps > 0 {
-                    v.stake * cfg.liquidity_mining_rate_bps / 10_000
+                    v.stake * cfg.liquidity_mining_rate_bps as i128 / 10_000
                 } else {
                     0
                 };
@@ -494,7 +504,7 @@ impl QuorumCreditContract {
             }
 
             env.events().publish(
-                (symbol_short!("loan"), symbol_short!("escrow_rej")),
+                (symbol_short!("loan"), symbol_short!("escrw_rej")),
                 (borrower.clone(), escrowed),
             );
         }

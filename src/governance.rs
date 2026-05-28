@@ -1,12 +1,12 @@
 use crate::errors::ContractError;
 use crate::helpers::{
     add_slash_balance, config, get_active_loan_record, get_latest_loan_record, has_active_loan,
-    require_governance_participant, require_not_paused,
+    require_admin_approval, require_governance_participant, require_not_paused,
 };
-use crate::insurance;
 use crate::types::{
-    DataKey, LoanStatus, SlashThresholdProposal, SlashVoteRecord, TimelockAction,
-    TimelockProposal, VouchRecord, BPS_DENOMINATOR, SlashAppealRecord,
+    DataKey, LoanStatus, PendingSlashRecord, RedistributionRule, SlashAppealRecord,
+    SlashRecord, SlashThresholdProposal, SlashVoteRecord, SlashingReportRecord,
+    TimelockAction, TimelockProposal, VouchRecord, BPS_DENOMINATOR, MONTHLY_PERIOD_SECS,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -147,7 +147,7 @@ pub fn vote_slash(
             .set(&DataKey::PendingSlashExecution(borrower.clone()), &pending_slash);
         
         env.events().publish(
-            (symbol_short!("gov"), symbol_short!("slash_pending")),
+            (symbol_short!("gov"), symbol_short!("slsh_pend")),
             (borrower.clone(), now, executable_at),
         );
     } else {
@@ -261,7 +261,7 @@ pub fn execute_pending_slash(env: Env, borrower: Address) -> Result<(), Contract
     execute_slash(&env, &borrower)?;
 
     env.events().publish(
-        (symbol_short!("gov"), symbol_short!("slash_executed")),
+        (symbol_short!("gov"), symbol_short!("slsh_exec")),
         (borrower.clone(), now),
     );
 
@@ -269,6 +269,13 @@ pub fn execute_pending_slash(env: Env, borrower: Address) -> Result<(), Contract
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
+
+fn borrower_registration_time(env: &Env, borrower: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BorrowerRegistered(borrower.clone()))
+        .unwrap_or(0)
+}
 
 fn check_borrower_immunity(env: &Env, borrower: &Address, cfg: &crate::types::Config) -> Result<(), ContractError> {
     if cfg.immunity_period_seconds == 0 {
@@ -971,4 +978,74 @@ pub fn get_slash_threshold_proposal(
     env.storage()
         .instance()
         .get(&DataKey::SlashThresholdProposal(proposal_id))
+}
+
+// ── Slashing Transparency Report ──────────────────────────────────────────────
+
+/// Generate (or refresh) the monthly slashing report for `month_id`.
+///
+/// `month_id` = `unix_timestamp / MONTHLY_PERIOD_SECS`.
+/// Iterates all recorded slash events and aggregates those whose
+/// `slash_timestamp` falls within the requested month window.
+/// The result is persisted under `DataKey::SlashingReport(month_id)`.
+pub fn generate_slashing_report(env: Env, month_id: u64) -> SlashingReportRecord {
+    let total_ids: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashRecordCounter)
+        .unwrap_or(0);
+
+    let month_start = month_id * MONTHLY_PERIOD_SECS;
+    let month_end = month_start + MONTHLY_PERIOD_SECS;
+
+    let mut slash_ids: Vec<u64> = Vec::new(&env);
+    let mut total_slashed: i128 = 0;
+    let mut total_slashes: u32 = 0;
+    let mut total_reversed: u32 = 0;
+
+    for id in 1..=total_ids {
+        let record: crate::types::SlashRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashRecord(id))
+        {
+            Some(r) => r,
+            None => continue,
+        };
+
+        if record.slash_timestamp >= month_start && record.slash_timestamp < month_end {
+            total_slashes += 1;
+            total_slashed += record.total_slashed;
+            if record.reversed {
+                total_reversed += 1;
+            }
+            slash_ids.push_back(id);
+        }
+    }
+
+    let report = SlashingReportRecord {
+        month_id,
+        total_slashes,
+        total_slashed,
+        total_reversed,
+        slash_ids,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::SlashingReport(month_id), &report);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("rpt_gen")),
+        (month_id, total_slashes, total_slashed),
+    );
+
+    report
+}
+
+/// Return the cached slashing report for `month_id`, or `None` if not yet generated.
+pub fn get_slashing_report(env: Env, month_id: u64) -> Option<SlashingReportRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SlashingReport(month_id))
 }
