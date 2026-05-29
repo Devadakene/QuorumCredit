@@ -6,14 +6,18 @@ use soroban_sdk::{
 
 pub mod admin;
 pub mod benchmarks;
+pub mod commitment_validator;
 pub mod errors;
 pub mod fraud_detection;
 pub mod governance;
 pub mod health;
 pub mod helpers;
+pub mod key_manager;
 pub mod liquidity_mining;
 pub mod loan;
 pub mod reputation;
+pub mod secure_delete;
+pub mod secure_random;
 pub mod staking_derivatives;
 pub mod types;
 pub mod upgrade;

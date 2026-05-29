@@ -200,6 +200,8 @@ pub enum DataKey {
     PartialDefaultCount(Address),
     // #664: Slash record with forgiveness info per loan
     SlashRecord(u64),
+    // #704: Managed derived key storage
+    ManagedKey(soroban_sdk::BytesN<32>),
 }
 
 // ── Loan Health Monitoring ────────────────────────────────────────────────────
