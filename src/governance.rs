@@ -1,4 +1,4 @@
-use crate::errors::ContractError;
+﻿use crate::errors::ContractError;
 use crate::helpers::{
     add_slash_balance, config, get_active_loan_record, get_latest_loan_record, has_active_loan,
     require_admin_approval, require_governance_participant, require_not_paused,
@@ -177,7 +177,7 @@ pub fn get_slash_vote(env: Env, borrower: Address) -> Option<SlashVoteRecord> {
 }
 
 /// Set the quorum threshold (in basis points) required to auto-execute a slash.
-/// Requires admin approval — called from admin module.
+/// Requires admin approval â€” called from admin module.
 pub fn set_slash_vote_quorum(env: &Env, quorum_bps: u32) {
     if quorum_bps > 10_000 {
         panic_with_error!(env, ContractError::InvalidBps);
@@ -278,7 +278,7 @@ pub fn execute_pending_slash(env: Env, borrower: Address) -> Result<(), Contract
     Ok(())
 }
 
-// ── Internal ──────────────────────────────────────────────────────────────────
+// â”€â”€ Internal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn next_slash_id(env: &Env) -> u64 {
     let id = env
@@ -386,6 +386,17 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 
     let mut total_slashed: i128 = 0;
     let mut remaining_vouches: Vec<VouchRecord> = Vec::new(env);
+    // Calculate effective slash basis points based on default count (graduated penalties)
+    let default_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::DefaultCount(borrower.clone()))
+        .unwrap_or(0);
+    let base_slash_bps = cfg.slash_bps;
+    let mut effective_slash_bps = base_slash_bps + (default_count as i128) * 500;
+    if effective_slash_bps > 10_000 {
+        effective_slash_bps = 10_000;
+    }
 
     for v in vouches.iter() {
         if v.token != loan.token_address {
@@ -484,7 +495,7 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
     Ok(())
 }
 
-/// ── Issue 109: Slash Proposal Confirmation Window ──
+/// â”€â”€ Issue 109: Slash Proposal Confirmation Window â”€â”€
 ///
 /// Implements a two-step slash with timelock pattern:
 /// 1. propose_slash: Admin creates a proposal, sets execution time (eta)
@@ -771,7 +782,7 @@ pub fn execute_slash_appeal(
     Ok(())
 }
 
-// ── Issue #680: Slash threshold governance voting ─────────────────────────────
+// â”€â”€ Issue #680: Slash threshold governance voting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub fn propose_slash_threshold(
     env: Env,
