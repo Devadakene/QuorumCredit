@@ -23,6 +23,8 @@ pub const TIME_WEIGHTED_YIELD_BONUS_MULTIPLIER: i128 = 12; // 1.2x = 12/10
 pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 // Task 4: Dispute constants
 pub const DEFAULT_DISPUTE_WINDOW_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+// Task 701: Emergency shutdown & timestamp validation
+pub const DEFAULT_TIMESTAMP_TOLERANCE_SECS: u64 = 5 * 60; // 5 minutes
 
 // ── Loan Size Tiers ───────────────────────────────────────────────────────────
 
@@ -202,6 +204,10 @@ pub enum DataKey {
     SlashRecord(u64),
     // #704: Managed derived key storage
     ManagedKey(soroban_sdk::BytesN<32>),
+    // #747: Loan to Equity Conversion
+    EquityConversionTerms(u64), // loan_id → EquityConversionTerms
+    // #748: Cross-Default Configuration
+    CrossDefaultEnabled,        // bool: whether cross-default clause is active
 }
 
 // ── Loan Health Monitoring ────────────────────────────────────────────────────
@@ -377,6 +383,12 @@ pub struct Config {
     /// Period in seconds over which decay_rate_bps is applied.
     /// 0 = decay disabled. E.g. 30 * 24 * 60 * 60 = 30 days.
     pub decay_period_secs: u64,
+    /// #700: Timestamp tolerance in seconds. Transactions with timestamps outside this
+    /// window relative to ledger timestamp are rejected. Default: 5 minutes (300 secs).
+    pub timestamp_tolerance_seconds: u64,
+    /// #701: Emergency shutdown enabled flag. When true, all state-mutating operations
+    /// are blocked except for reads and admin functions.
+    pub emergency_shutdown_enabled: bool,
 }
 
 // ── Per-Token Config ──────────────────────────────────────────────────────────
@@ -591,3 +603,29 @@ pub struct SlashRecord {
     /// Timestamp when forgiveness was granted (0 if not forgiven).
     pub forgiven_at: u64,
 }
+
+// ── #747: Loan Conversion to Equity ────────────────────────────────────────────
+
+/// Terms for converting a loan into equity stake in borrower's business.
+#[contracttype]
+#[derive(Clone)]
+pub struct EquityConversionTerms {
+    /// Percentage of equity stake borrower grants in exchange for loan forgiveness (0-10000 basis points).
+    pub equity_percentage_bps: u32,
+    /// Timestamp when conversion terms were agreed upon.
+    pub agreed_at: u64,
+    /// Whether the conversion has been executed.
+    pub executed: bool,
+    /// Timestamp of execution (0 if not yet executed).
+    pub executed_at: u64,
+}
+
+/// Storage key extension for conversion terms in LoanRecord.
+#[contracttype]
+pub enum DataKeyExtension {
+    EquityTerms(u64), // loan_id → EquityConversionTerms
+}
+
+// ── #748: Cross-Default Clause ────────────────────────────────────────────────
+
+/// Cross-default enabled flag stored in Config via DataKey.
