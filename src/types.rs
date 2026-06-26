@@ -288,6 +288,23 @@ pub struct ThawState {
 /// Duration of the thaw period in seconds (24 hours).
 pub const THAW_DURATION_SECS: u64 = 24 * 60 * 60;
 
+// ── Governance Proposal Status ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    /// Proposal is under active voting.
+    Active,
+    /// Proposal has passed and is executable.
+    Passed,
+    /// Proposal has been rejected.
+    Rejected,
+    /// Proposal voting period has expired.
+    Expired,
+    /// Proposal has been executed.
+    Executed,
+}
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
