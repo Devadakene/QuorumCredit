@@ -59,6 +59,14 @@ mod integration_invariants;
 mod integration_stress_test;
 #[cfg(test)]
 mod integration_regression_test;
+#[cfg(test)]
+mod upgrade_safety_test;
+#[cfg(test)]
+mod rate_limiting_test;
+#[cfg(test)]
+mod anti_dust_attack_test;
+#[cfg(test)]
+mod vulnerability_policy_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
