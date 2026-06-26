@@ -166,4 +166,22 @@ GradualUnstakeNotFound = 135,
 GradualUnstakeAlreadyActive = 136,
 /// The next instalment is not yet due.
 GradualUnstakeNotDue = 137,
+/// Co-borrower is already added to this loan.
+CoBorrowerAlreadyAdded = 138,
+/// Maximum number of co-borrowers exceeded.
+MaxCoBorrowersExceeded = 139,
+/// Cannot add self as co-borrower.
+SelfCoBorrowerNotAllowed = 140,
+/// Loan is currently in forbearance — operation not allowed.
+LoanInForbearance = 141,
+/// Maximum forbearance periods exceeded for this loan.
+MaxForbearanceExceeded = 142,
+/// Forbearance not found for this loan.
+ForbearanceNotFound = 143,
+/// Forbearance is not currently active.
+ForbearanceNotActive = 144,
+/// Cannot refinance — no outstanding balance.
+RefinanceNoOutstanding = 145,
+/// Dynamic rate configuration is invalid.
+InvalidDynamicRateConfig = 146,
 }
