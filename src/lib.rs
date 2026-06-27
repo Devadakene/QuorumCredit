@@ -103,7 +103,10 @@ mod co_borrower_test;
 mod incremental_config_test;
 
 #[cfg(test)]
-mod storage_compaction_test;#[cfg(test)]
+mod storage_compaction_test;
+
+#[cfg(test)]
+mod vectorized_score_test;#[cfg(test)]
 mod dynamic_rate_test;
 #[cfg(test)]
 mod forbearance_test;
