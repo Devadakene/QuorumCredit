@@ -100,7 +100,10 @@ mod loan_features_test;
 mod co_borrower_test;
 
 #[cfg(test)]
-mod incremental_config_test;#[cfg(test)]
+mod incremental_config_test;
+
+#[cfg(test)]
+mod storage_compaction_test;#[cfg(test)]
 mod dynamic_rate_test;
 #[cfg(test)]
 mod forbearance_test;
