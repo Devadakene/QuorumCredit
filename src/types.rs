@@ -480,20 +480,17 @@ pub enum DataKey {
     // ── Issue #885: Loan Status Privacy ──────────────────────────────────────
     /// borrower → LoanPrivacyLevel
     LoanPrivacy(Address),
-    // ── Issue #63: Signature Replay Protection ────────────────────────────────
-    /// caller → last consumed nonce (u64); used to prevent signature replay.
-    Nonce(Address),
-    // ── Issue #64: Oracle Price Staleness ─────────────────────────────────────
-    /// oracle_key (Symbol) → OraclePriceRecord
-    OraclePrice(soroban_sdk::Symbol),
-    // ── Issue #65: Graduated Response / Tiered Lockdown ───────────────────────
-    /// Current threat level governing protocol restrictions.
-    ThreatLevelKey,
-    // ── Issue #66: LRU Cache Index ────────────────────────────────────────────
-    /// u32 count of tracked loan cache entries (for LRU eviction).
-    LruIndex,
-    /// u64 loan_id of the oldest cached loan entry (LRU eviction pointer).
-    LruOldestLoanId,
+    // ── Issue #887: Loan Subordination and Cascading Debt Hierarchy ──────────
+    /// (senior_loan_id, subordinate_loan_id) → SubordinationRecord
+    SubordinationRelation(u64, u64),
+    /// senior_loan_id → Vec<u64> (IDs of all subordinate loans ordered by priority)
+    SubordinateLoansList(u64),
+    /// subordinate_loan_id → u64 (ID of direct senior loan, if any)
+    SeniorLoanOf(u64),
+    /// senior_loan_id → CascadingDefault (tracks cascade triggered by default)
+    CascadingDefaultRecord(u64),
+    /// Waterfall distribution configuration for a borrower
+    WaterfallConfig(Address),
 }
 
 /// Issue #867: Shared collateral pool backed by multiple vouchers.
@@ -1616,52 +1613,77 @@ pub enum LoanPrivacyLevel {
     Private,
 }
 
-// ── Issue #63: Signature Replay Protection ────────────────────────────────────
+// ── Issue #887: Loan Subordination and Cascading Debt Hierarchy ──────────────
 
-/// How many nonce slots to keep in history before rolling over (per caller).
-/// A window of 1_000 gives ~1 k in-flight requests before a nonce is reusable.
-pub const NONCE_WINDOW: u64 = 1_000;
-
-// ── Issue #64: Oracle Price Staleness ─────────────────────────────────────────
-
-/// Maximum age (in seconds) for an oracle price before it is considered stale (5 minutes).
-pub const ORACLE_PRICE_MAX_AGE_SECS: u64 = 5 * 60;
-
-/// On-chain oracle price record written by the registered oracle contract.
+/// Issue #887: Subordination level in the debt hierarchy.
+/// Determines priority order for repayment and default cascading.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OraclePriceRecord {
-    /// Price in micro-units (e.g. stroops-per-USD, scaled by 1e7).
-    pub price: i128,
-    /// Ledger timestamp when the price was recorded.
-    pub recorded_at: u64,
-    /// Oracle address that submitted this price.
-    pub oracle: Address,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SubordinationLevel {
+    /// Senior (Priority 0): Highest priority. Must be fully repaid first.
+    /// Default of senior loan blocks all subordinate loans.
+    Senior = 0,
+    /// Mezzanine (Priority 1): Intermediate level.
+    /// Can have both senior and subordinate loans.
+    Mezzanine = 1,
+    /// Subordinate (Priority 2+): Lowest priority.
+    /// Repaid after seniors. Affected by senior defaults (cascading).
+    Subordinate = 2,
 }
 
-// ── Issue #65: Graduated Response / Tiered Lockdown ───────────────────────────
-
-/// Protocol threat level governing which operations are permitted.
-///
-/// | Level    | Restriction                                     |
-/// |----------|-------------------------------------------------|
-/// | Normal   | All operations allowed (default).               |
-/// | Elevated | New vouches and loans blocked.                  |
-/// | Critical | All writes blocked (read-only).                 |
-/// | Lockdown | Full halt — even reads are rate-limited.        |
+/// Issue #887: Represents a subordination relationship between two loans.
+/// Links a subordinate (junior) loan to its senior (creditor priority) loan.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ThreatLevel {
-    Normal,
-    Elevated,
-    Critical,
-    Lockdown,
+#[derive(Clone)]
+pub struct SubordinationRecord {
+    /// ID of the senior (higher priority) loan
+    pub senior_loan_id: u64,
+    /// ID of the subordinate (lower priority) loan
+    pub subordinate_loan_id: u64,
+    /// The subordination level relative to the senior loan
+    pub subordination_level: SubordinationLevel,
+    /// Ledger timestamp when this subordination relationship was created
+    pub created_at: u64,
+    /// Whether this subordination is currently active (true) or waived (false)
+    pub is_active: bool,
+    /// Priority order index if senior loan has multiple subordinates (0 = highest priority)
+    pub priority_index: u32,
 }
 
-// ── Issue #66: Read-Optimized Cache ───────────────────────────────────────────
+/// Issue #887: Represents cascading default information.
+/// Tracks which loans are affected when a senior loan defaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct CascadingDefault {
+    /// ID of the senior loan that defaulted and triggered the cascade
+    pub triggering_senior_loan_id: u64,
+    /// IDs of all subordinate loans affected by this default
+    pub affected_subordinate_ids: Vec<u64>,
+    /// Ledger timestamp when the cascade was triggered
+    pub triggered_at: u64,
+    /// Whether the cascade has been fully resolved (all affected loans handled)
+    pub is_resolved: bool,
+}
 
-/// TTL for cached records in seconds (5 minutes).
-pub const CACHE_TTL_SECS: u64 = 5 * 60;
+/// Issue #887: Waterfall repayment distribution result.
+/// Specifies how a repayment should be split between senior and subordinate loans.
+#[contracttype]
+#[derive(Clone)]
+pub struct WaterfallDistribution {
+    /// Amount to apply to the senior loan in stroops
+    pub senior_amount: i128,
+    /// Amount to apply to subordinate loans in stroops
+    pub subordinate_amount: i128,
+    /// Total amount distributed across all tiers
+    pub total_distributed: i128,
+}
 
-/// Maximum number of cache entries tracked by the LRU index.
-pub const CACHE_LRU_MAX_ENTRIES: u32 = 64;
+/// Issue #887: DataKey for subordination relationships
+/// Added to DataKey enum for storage:
+/// `SubordinationRelation(u64, u64)` => (senior_loan_id, subordinate_loan_id) -> SubordinationRecord
+/// `SubordinateLoansList(u64)` => senior_loan_id -> Vec<u64> (IDs of all subordinate loans)
+/// `SeniorLoanOf(u64)` => subordinate_loan_id -> u64 (ID of direct senior loan)
+/// `CascadingDefaultRecord(u64)` => senior_loan_id -> CascadingDefault
+pub const MAX_SUBORDINATION_DEPTH: u32 = 10; // Prevent deeply nested hierarchies
+pub const MAX_SUBORDINATES_PER_LOAN: u32 = 50; // Prevent excessive branching
