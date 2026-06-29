@@ -26,7 +26,7 @@ mod referral_test;
 pub use errors::ContractError;
 pub use types::*;
 
-use helpers::{config, require_valid_token, validate_admin_config};
+use helpers::{config, get_active_loan_record, is_zero_address, require_valid_token, validate_admin_config};
 use reputation::ReputationNftExternalClient;
 
 #[contract]
@@ -498,14 +498,14 @@ impl QuorumCreditContract {
 
         Self::require_not_paused(&env).expect("contract is paused");
 
-        // ── CHECKS ────────────────────────────────────────────────────────────
-        let mut loan: LoanRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Loan(borrower.clone()))
-            .expect("no active loan");
+        let mut loan = if let Ok(l) = get_active_loan_record(&env, &borrower) {
+            l
+        } else if let Some(l) = env.storage().persistent().get(&DataKey::Loan(borrower.clone())) {
+            l
+        } else {
+            panic_with_error!(&env, ContractError::NoActiveLoan);
+        };
 
-        // Guard: only an active (non-repaid, non-defaulted) loan may be slashed.
         if loan.repaid || loan.defaulted {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
@@ -517,25 +517,49 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        // ── EFFECTS ───────────────────────────────────────────────────────────
         loan.defaulted = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Loan(borrower.clone()), &loan);
-
+        if env.storage().persistent().has(&DataKey::ActiveLoan(borrower.clone())) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(loan.id), &loan);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveLoan(borrower.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(borrower.clone()), &loan);
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::Vouches(borrower.clone()));
 
-        let token = Self::token_client(&env);
+        let token_client = if is_zero_address(&env, &loan.token_address) {
+            Self::token_client(&env)
+        } else {
+            soroban_sdk::token::Client::new(&env, &loan.token_address)
+        };
+
         let mut total_slashed: i128 = 0;
         for v in vouches.iter() {
-            let slash_amount = v.stake * cfg.slash_bps / 10_000;
-            let returned = v.stake - slash_amount;
-            if returned > 0 {
-                token.transfer(&env.current_contract_address(), &v.voucher, &returned);
+            if is_zero_address(&env, &loan.token_address) {
+                let slash_amount = v.stake * cfg.slash_bps / 10_000;
+                let returned = v.stake - slash_amount;
+                if returned > 0 {
+                    token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+                }
+                total_slashed += slash_amount;
+            } else if v.token == loan.token_address {
+                let slash_amount = v.stake * cfg.slash_bps / 10_000;
+                let returned = v.stake - slash_amount;
+                if returned > 0 {
+                    token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+                }
+                total_slashed += slash_amount;
+            } else if !is_zero_address(&env, &v.token) {
+                let other_token = soroban_sdk::token::Client::new(&env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
             }
-            total_slashed += slash_amount;
         }
 
         let treasury: i128 = env
@@ -547,7 +571,15 @@ impl QuorumCreditContract {
             .instance()
             .set(&DataKey::SlashTreasury, &(treasury + total_slashed));
 
-        // Burn one reputation point if a reputation NFT contract is configured.
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DefaultCount(borrower.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DefaultCount(borrower.clone()), &(count + 1));
+
         if let Some(nft_addr) = env
             .storage()
             .instance()
@@ -567,13 +599,14 @@ impl QuorumCreditContract {
     pub fn claim_expired_loan(env: Env, borrower: Address) {
         borrower.require_auth();
 
-        let loan: LoanRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Loan(borrower.clone()))
-            .expect("no active loan");
+        let loan = if let Ok(l) = get_active_loan_record(&env, &borrower) {
+            l
+        } else if let Some(l) = env.storage().persistent().get(&DataKey::Loan(borrower.clone())) {
+            l
+        } else {
+            panic_with_error!(&env, ContractError::NoActiveLoan);
+        };
 
-        // Guard: only an active (non-repaid, non-defaulted) loan may be claimed.
         if loan.repaid || loan.defaulted {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
@@ -581,27 +614,55 @@ impl QuorumCreditContract {
         let now = env.ledger().timestamp();
         assert!(now >= loan.deadline, "loan has not expired yet");
 
-        let token = Self::token(&env);
         let vouches: Vec<VouchRecord> = env
             .storage()
             .persistent()
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
+        let token_client = if is_zero_address(&env, &loan.token_address) {
+            Self::token_client(&env)
+        } else {
+            soroban_sdk::token::Client::new(&env, &loan.token_address)
+        };
+
         for v in vouches.iter() {
-            token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            if is_zero_address(&env, &loan.token_address) {
+                token_client.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            } else if v.token == loan.token_address {
+                token_client.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            } else if !is_zero_address(&env, &v.token) {
+                let other_token = soroban_sdk::token::Client::new(&env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            }
         }
 
         let mut loan = loan;
         loan.defaulted = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Loan(borrower.clone()), &loan);
-
+        if env.storage().persistent().has(&DataKey::ActiveLoan(borrower.clone())) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(loan.id), &loan);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveLoan(borrower.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(borrower.clone()), &loan);
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::Vouches(borrower));
-    }
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DefaultCount(borrower.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DefaultCount(borrower.clone()), &(count + 1));
 
     /// Admin withdraws accumulated slashed funds to a recipient address.
     pub fn slash_treasury(env: Env, admin_signers: Vec<Address>, recipient: Address) {
@@ -661,17 +722,15 @@ impl QuorumCreditContract {
 
     // ── Loan Deadline ─────────────────────────────────────────────────────────
 
-    /// Callable by anyone after the loan deadline has passed.
-    /// Applies the standard slash penalty.
     pub fn auto_slash(env: Env, borrower: Address) {
-        // ── CHECKS ────────────────────────────────────────────────────────────
-        let mut loan: LoanRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Loan(borrower.clone()))
-            .expect("no active loan");
+        let mut loan = if let Ok(l) = get_active_loan_record(&env, &borrower) {
+            l
+        } else if let Some(l) = env.storage().persistent().get(&DataKey::Loan(borrower.clone())) {
+            l
+        } else {
+            panic_with_error!(&env, ContractError::NoActiveLoan);
+        };
 
-        // Guard: only an active (non-repaid, non-defaulted) loan may be auto-slashed.
         if loan.repaid || loan.defaulted {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
@@ -687,20 +746,51 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        // ── EFFECTS ───────────────────────────────────────────────────────────
         loan.defaulted = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Loan(borrower.clone()), &loan);
-
+        if env.storage().persistent().has(&DataKey::ActiveLoan(borrower.clone())) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(loan.id), &loan);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveLoan(borrower.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(borrower.clone()), &loan);
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::Vouches(borrower.clone()));
 
+        let token_client = if is_zero_address(&env, &loan.token_address) {
+            Self::token_client(&env)
+        } else {
+            soroban_sdk::token::Client::new(&env, &loan.token_address)
+        };
+
         let mut total_slash: i128 = 0;
         for v in vouches.iter() {
-            total_slash += v.stake * cfg.slash_bps / 10_000;
+            if is_zero_address(&env, &loan.token_address) {
+                let slash_amount = v.stake * cfg.slash_bps / 10_000;
+                total_slash += slash_amount;
+                let returned = v.stake - slash_amount;
+                if returned > 0 {
+                    token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+                }
+            } else if v.token == loan.token_address {
+                let slash_amount = v.stake * cfg.slash_bps / 10_000;
+                total_slash += slash_amount;
+                let returned = v.stake - slash_amount;
+                if returned > 0 {
+                    token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+                }
+            } else if !is_zero_address(&env, &v.token) {
+                let other_token = soroban_sdk::token::Client::new(&env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            }
         }
+
         let treasury: i128 = env
             .storage()
             .instance()
@@ -710,15 +800,14 @@ impl QuorumCreditContract {
             .instance()
             .set(&DataKey::SlashTreasury, &(treasury + total_slash));
 
-        // ── INTERACTIONS ──────────────────────────────────────────────────────
-        let token = Self::token(&env);
-        for v in vouches.iter() {
-            let slash_amount = v.stake * cfg.slash_bps / 10_000;
-            let returned = v.stake - slash_amount;
-            if returned > 0 {
-                token.transfer(&env.current_contract_address(), &v.voucher, &returned);
-            }
-        }
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DefaultCount(borrower.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DefaultCount(borrower.clone()), &(count + 1));
 
         if let Some(nft_addr) = env
             .storage()

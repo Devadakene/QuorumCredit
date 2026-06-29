@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod multi_asset_tests {
-    use crate::{ContractError, QuorumCreditContract, QuorumCreditContractClient};
+    use crate::{ContractError, LoanStatus, QuorumCreditContract, QuorumCreditContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::StellarAssetClient,
@@ -116,5 +116,107 @@ mod multi_asset_tests {
 
         let loan = s.client.get_loan(&borrower).unwrap();
         assert_eq!(loan.token_address, s.xlm);
+    }
+
+    fn admin_signers(env: &Env, admin: &Address) -> Vec<Address> {
+        Vec::from_array(env, [admin.clone()])
+    }
+
+    #[test]
+    fn test_admin_slash_cross_token_only_slashes_matching_vouches() {
+        let s = setup();
+        let borrower = Address::generate(&s.env);
+        let usdc_voucher = Address::generate(&s.env);
+        let xlm_voucher = Address::generate(&s.env);
+
+        StellarAssetClient::new(&s.env, &s.usdc).mint(&usdc_voucher, &1_000_000);
+        StellarAssetClient::new(&s.env, &s.xlm).mint(&xlm_voucher, &1_000_000);
+
+        s.client.vouch(&usdc_voucher, &borrower, &1_000_000, &s.usdc);
+        s.client.vouch(&xlm_voucher, &borrower, &1_000_000, &s.xlm);
+        s.client.request_loan(&borrower, &100_000, &500_000, &purpose(&s.env), &s.usdc);
+
+        let admins = admin_signers(&s.env, &s.admin);
+        s.client.slash(&admins, &borrower);
+
+        assert_eq!(s.client.loan_status(&borrower), crate::LoanStatus::Defaulted);
+
+        let usdc_balance = StellarAssetClient::new(&s.env, &s.usdc).balance(&usdc_voucher);
+        let xlm_balance = StellarAssetClient::new(&s.env, &s.xlm).balance(&xlm_voucher);
+
+        assert_eq!(usdc_balance, 500_000);
+        assert_eq!(xlm_balance, 1_000_000);
+    }
+
+    #[test]
+    fn test_auto_slash_cross_token_only_slashes_matching_vouches() {
+        let s = setup();
+        let borrower = Address::generate(&s.env);
+        let usdc_voucher = Address::generate(&s.env);
+        let xlm_voucher = Address::generate(&s.env);
+
+        StellarAssetClient::new(&s.env, &s.usdc).mint(&usdc_voucher, &1_000_000);
+        StellarAssetClient::new(&s.env, &s.xlm).mint(&xlm_voucher, &1_000_000);
+
+        s.client.vouch(&usdc_voucher, &borrower, &1_000_000, &s.usdc);
+        s.client.vouch(&xlm_voucher, &borrower, &1_000_000, &s.xlm);
+        s.client.request_loan(&borrower, &100_000, &500_000, &purpose(&s.env), &s.usdc);
+
+        s.env.ledger().with_mut(|l| l.timestamp += 3_154_001);
+
+        s.client.auto_slash(&borrower);
+
+        assert_eq!(s.client.loan_status(&borrower), crate::LoanStatus::Defaulted);
+
+        let usdc_balance = StellarAssetClient::new(&s.env, &s.usdc).balance(&usdc_voucher);
+        let xlm_balance = StellarAssetClient::new(&s.env, &s.xlm).balance(&xlm_voucher);
+
+        assert_eq!(usdc_balance, 500_000);
+        assert_eq!(xlm_balance, 1_000_000);
+    }
+
+    #[test]
+    fn test_vote_slash_cross_token_only_slashes_matching_vouches() {
+        let s = setup();
+        let borrower = Address::generate(&s.env);
+        let usdc_voucher = Address::generate(&s.env);
+        let xlm_voucher = Address::generate(&s.env);
+
+        StellarAssetClient::new(&s.env, &s.usdc).mint(&usdc_voucher, &1_000_000);
+        StellarAssetClient::new(&s.env, &s.xlm).mint(&xlm_voucher, &1_000_000);
+
+        s.client.vouch(&usdc_voucher, &borrower, &1_000_000, &s.usdc);
+        s.client.vouch(&xlm_voucher, &borrower, &1_000_000, &s.xlm);
+        s.client.request_loan(&borrower, &100_000, &500_000, &purpose(&s.env), &s.usdc);
+
+        s.client.vote_slash(&usdc_voucher, &borrower, &true);
+
+        assert_eq!(s.client.loan_status(&borrower), crate::LoanStatus::Defaulted);
+
+        let usdc_balance = StellarAssetClient::new(&s.env, &s.usdc).balance(&usdc_voucher);
+        let xlm_balance = StellarAssetClient::new(&s.env, &s.xlm).balance(&xlm_voucher);
+
+        assert_eq!(usdc_balance, 500_000);
+        assert_eq!(xlm_balance, 1_000_000);
+    }
+
+    #[test]
+    fn test_admin_slash_treasury_only_counts_matching_token() {
+        let s = setup();
+        let borrower = Address::generate(&s.env);
+        let usdc_voucher = Address::generate(&s.env);
+        let xlm_voucher = Address::generate(&s.env);
+
+        StellarAssetClient::new(&s.env, &s.usdc).mint(&usdc_voucher, &1_000_000);
+        StellarAssetClient::new(&s.env, &s.xlm).mint(&xlm_voucher, &1_000_000);
+
+        s.client.vouch(&usdc_voucher, &borrower, &1_000_000, &s.usdc);
+        s.client.vouch(&xlm_voucher, &borrower, &1_000_000, &s.xlm);
+        s.client.request_loan(&borrower, &100_000, &500_000, &purpose(&s.env), &s.usdc);
+
+        let admins = admin_signers(&s.env, &s.admin);
+        s.client.slash(&admins, &borrower);
+
+        assert_eq!(s.client.get_slash_treasury_balance(), 500_000);
     }
 }

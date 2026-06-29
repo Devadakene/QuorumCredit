@@ -1,5 +1,5 @@
 use crate::errors::ContractError;
-use crate::helpers::{add_slash_balance, config, get_active_loan_record, require_not_paused};
+use crate::helpers::{add_slash_balance, config, get_active_loan_record, is_zero_address, require_not_paused};
 use crate::types::{DataKey, SlashVoteRecord, VouchRecord};
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 
@@ -143,15 +143,17 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
     let mut total_slashed: i128 = 0;
 
     for v in vouches.iter() {
-        if v.token != loan.token_address {
-            continue;
-        }
-        let slash_amount = v.stake * cfg.slash_bps / 10_000;
-        let remaining = v.stake - slash_amount;
-        total_slashed += slash_amount;
+        if v.token == loan.token_address {
+            let slash_amount = v.stake * cfg.slash_bps / 10_000;
+            let remaining = v.stake - slash_amount;
+            total_slashed += slash_amount;
 
-        if remaining > 0 {
-            loan_token.transfer(&env.current_contract_address(), &v.voucher, &remaining);
+            if remaining > 0 {
+                loan_token.transfer(&env.current_contract_address(), &v.voucher, &remaining);
+            }
+        } else if !is_zero_address(env, &v.token) {
+            let other_token = soroban_sdk::token::Client::new(env, &v.token);
+            other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
         }
     }
 
