@@ -1,16 +1,41 @@
-use crate::helpers::{config, require_admin_approval, validate_admin_config};
-use crate::types::{Config, DataKey};
-use soroban_sdk::{symbol_short, Address, BytesN, Env, Vec};
+use crate::errors::ContractError;
+use crate::helpers::{
+    config, is_admin, require_admin_approval, require_not_paused, require_valid_token,
+    validate_admin_config,
+};
+use crate::types::{
+    AdminActionProposal, AdminOperationType, Config, ConfigUpdateKey, ConfigUpdateProposal,
+    DataKey, GovernanceAction, GovernanceProposal, GovernanceProposalStatus,
+    GovernanceQueueConfig, MultiTierAdminThresholds, DEFAULT_GOVERNANCE_EXECUTION_WINDOW,
+    DEFAULT_GOVERNANCE_TIMELOCK_DELAY,
+};
+use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env, Vec};
+
+fn validate_admin_member(env: &Env, admin: &Address, config: &Config) {
+    if !config.admin_whitelist.is_empty()
+        && !config.admin_whitelist.iter().any(|allowed| allowed == *admin)
+    {
+        panic_with_error!(&env, ContractError::AdminNotWhitelisted);
+    }
+    if config
+        .admin_blacklist
+        .iter()
+        .any(|blocked| blocked == *admin)
+    {
+        panic_with_error!(&env, ContractError::AdminBlacklisted);
+    }
+}
 
 pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
     require_admin_approval(&env, &admin_signers);
 
     let mut cfg = config(&env);
 
-    assert!(
-        !cfg.admins.iter().any(|a| a == new_admin),
-        "address is already an admin"
-    );
+    validate_admin_member(&env, &new_admin, &cfg);
+
+    if cfg.admins.iter().any(|a| a == new_admin) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
 
     cfg.admins.push_back(new_admin.clone());
     env.storage().instance().set(&DataKey::Config, &cfg);
@@ -22,6 +47,13 @@ pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
 pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
     require_admin_approval(&env, &admin_signers);
 
+    // Issue #372: Prevent removing an admin who is one of the signers
+    for signer in admin_signers.iter() {
+        if signer == admin_to_remove {
+            panic_with_error!(&env, ContractError::UnauthorizedCaller);
+        }
+    }
+
     let mut cfg = config(&env);
 
     let idx = cfg
@@ -32,11 +64,12 @@ pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Addr
 
     cfg.admins.remove(idx);
 
-    assert!(!cfg.admins.is_empty(), "cannot remove the last admin");
-    assert!(
-        cfg.admin_threshold <= cfg.admins.len(),
-        "removal would make threshold unsatisfiable"
-    );
+    if cfg.admins.is_empty() {
+        panic_with_error!(&env, ContractError::UnauthorizedCaller);
+    }
+    if cfg.admin_threshold > cfg.admins.len() {
+        panic_with_error!(&env, ContractError::InvalidAdminThreshold);
+    }
 
     env.storage().instance().set(&DataKey::Config, &cfg);
 
@@ -49,14 +82,17 @@ pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Addr
 pub fn rotate_admin(env: Env, admin_signers: Vec<Address>, old_admin: Address, new_admin: Address) {
     require_admin_approval(&env, &admin_signers);
 
-    assert!(old_admin != new_admin, "old and new admin must differ");
+    if old_admin == new_admin {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
 
     let mut cfg = config(&env);
 
-    assert!(
-        !cfg.admins.iter().any(|a| a == new_admin),
-        "new admin is already in the admin set"
-    );
+    validate_admin_member(&env, &new_admin, &cfg);
+
+    if cfg.admins.iter().any(|a| a == new_admin) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
 
     let idx = cfg
         .admins
@@ -78,11 +114,12 @@ pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold:
 
     let mut cfg = config(&env);
 
-    assert!(new_threshold > 0, "threshold must be greater than zero");
-    assert!(
-        new_threshold <= cfg.admins.len(),
-        "threshold cannot exceed admin count"
-    );
+    if new_threshold == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if new_threshold > cfg.admins.len() {
+        panic_with_error!(&env, ContractError::InvalidAdminThreshold);
+    }
 
     cfg.admin_threshold = new_threshold;
     env.storage().instance().set(&DataKey::Config, &cfg);
@@ -93,9 +130,97 @@ pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold:
     );
 }
 
+/// Issue #688: Add an address to the admin whitelist.
+pub fn add_to_admin_whitelist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if cfg.admin_whitelist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
+    if cfg.admin_blacklist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AdminBlacklisted);
+    }
+
+    cfg.admin_whitelist.push_back(address.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wl_add")),
+        address,
+    );
+}
+
+/// Issue #688: Remove an address from the admin whitelist.
+pub fn remove_from_admin_whitelist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    let idx = cfg
+        .admin_whitelist
+        .iter()
+        .position(|a| a == address)
+        .expect("address not in whitelist") as u32;
+
+    cfg.admin_whitelist.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wl_rm")),
+        address,
+    );
+}
+
+/// Issue #689: Add an address to the admin blacklist.
+pub fn add_to_admin_blacklist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if cfg.admin_blacklist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AlreadyInitialized);
+    }
+    if cfg.admin_whitelist.iter().any(|a| a == address) {
+        panic_with_error!(&env, ContractError::AdminNotWhitelisted);
+    }
+
+    cfg.admin_blacklist.push_back(address.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("bl_add")),
+        address,
+    );
+}
+
+/// Issue #689: Remove an address from the admin blacklist.
+pub fn remove_from_admin_blacklist(env: Env, admin_signers: Vec<Address>, address: Address) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    let idx = cfg
+        .admin_blacklist
+        .iter()
+        .position(|a| a == address)
+        .expect("address not in blacklist") as u32;
+
+    cfg.admin_blacklist.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("bl_rm")),
+        address,
+    );
+}
+
 pub fn set_protocol_fee(env: Env, admin_signers: Vec<Address>, fee_bps: u32) {
     require_admin_approval(&env, &admin_signers);
-    assert!(fee_bps <= 10_000, "fee_bps must not exceed 10000");
+    if fee_bps > 10_000 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
     env.storage()
         .instance()
         .set(&DataKey::ProtocolFeeBps, &fee_bps);
@@ -116,6 +241,17 @@ pub fn whitelist_voucher(env: Env, admin_signers: Vec<Address>, voucher: Address
         .set(&DataKey::VoucherWhitelist(voucher), &true);
 }
 
+pub fn set_whitelist_enabled(env: Env, admin_signers: Vec<Address>, enabled: bool) {
+    require_admin_approval(&env, &admin_signers);
+    env.storage()
+        .instance()
+        .set(&DataKey::WhitelistEnabled, &enabled);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("wlena")),
+        (admin_signers.get(0).unwrap(), enabled),
+    );
+}
+
 pub fn set_fee_treasury(env: Env, admin_signers: Vec<Address>, treasury: Address) {
     require_admin_approval(&env, &admin_signers);
     env.storage()
@@ -133,20 +269,101 @@ pub fn upgrade(env: Env, admin_signers: Vec<Address>, new_wasm_hash: BytesN<32>)
 
 pub fn pause(env: Env, admin_signers: Vec<Address>) {
     require_admin_approval(&env, &admin_signers);
+    let now = env.ledger().timestamp();
     env.storage().instance().set(&DataKey::Paused, &true);
+    env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::Paused);
+    // Record the pause timestamp so begin_thaw() can reference it.
+    // ThawState is written with thaw_start_timestamp = 0 (thaw not yet started).
+    env.storage().instance().set(
+        &DataKey::ThawState,
+        &crate::types::ThawState {
+            pause_timestamp: now,
+            thaw_duration: crate::types::THAW_DURATION_SECS,
+            thaw_start_timestamp: 0,
+        },
+    );
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("pause")),
-        (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+        (admin_signers.get(0).unwrap(), now),
+    );
+}
+
+/// Transition from `Paused` → `Thawing`.
+/// Only reads and withdrawals are allowed during the thaw window (24 h).
+/// After the window elapses the contract auto-transitions back to `Normal`.
+pub fn begin_thaw(env: Env, admin_signers: Vec<Address>) {
+    require_admin_approval(&env, &admin_signers);
+    let mode: crate::types::PauseMode = env
+        .storage()
+        .instance()
+        .get(&DataKey::PauseMode)
+        .unwrap_or(crate::types::PauseMode::None);
+    assert!(
+        mode == crate::types::PauseMode::Paused,
+        "begin_thaw requires contract to be in Paused state"
+    );
+
+    let now = env.ledger().timestamp();
+    // Update existing ThawState with the actual thaw start timestamp.
+    let mut thaw: crate::types::ThawState = env
+        .storage()
+        .instance()
+        .get(&DataKey::ThawState)
+        .expect("pause state not found");
+    thaw.thaw_start_timestamp = now;
+
+    env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::Thawing);
+    env.storage().instance().set(&DataKey::ThawState, &thaw);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("beg_thaw")),
+        (admin_signers.get(0).unwrap(), now, thaw.thaw_duration),
     );
 }
 
 pub fn unpause(env: Env, admin_signers: Vec<Address>) {
     require_admin_approval(&env, &admin_signers);
     env.storage().instance().set(&DataKey::Paused, &false);
+    env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::None);
+    env.storage().instance().remove(&DataKey::ThawState);
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("unpause")),
         (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
     );
+}
+
+/// Pause the contract and immediately enter Thawing (combined one-step operation).
+/// Writes are blocked immediately; reads and withdrawals allowed for `thaw_duration` seconds.
+pub fn pause_with_thaw(env: Env, admin_signers: Vec<Address>, thaw_duration: u64) {
+    require_admin_approval(&env, &admin_signers);
+    let now = env.ledger().timestamp();
+
+    env.storage().instance().set(&DataKey::Paused, &true);
+    env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::Thawing);
+    env.storage().instance().set(
+        &DataKey::ThawState,
+        &crate::types::ThawState {
+            pause_timestamp: now,
+            thaw_duration,
+            thaw_start_timestamp: now,
+        },
+    );
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("pse_thaw")),
+        (admin_signers.get(0).unwrap(), now, thaw_duration),
+    );
+}
+
+/// Check if contract is in thaw period and allow emergency withdrawals
+pub fn is_in_thaw_period(env: &Env) -> bool {
+    if let Some(thaw_state) = env.storage().instance().get::<_, crate::types::ThawState>(&DataKey::ThawState) {
+        let now = env.ledger().timestamp();
+        let thaw_end = thaw_state.thaw_start_timestamp + thaw_state.thaw_duration;
+        thaw_state.thaw_start_timestamp > 0 && now <= thaw_end
+    } else {
+        false
+    }
 }
 
 pub fn blacklist(env: Env, admin_signers: Vec<Address>, borrower: Address) {
@@ -157,30 +374,40 @@ pub fn blacklist(env: Env, admin_signers: Vec<Address>, borrower: Address) {
 }
 
 pub fn set_config(env: Env, admin_signers: Vec<Address>, config: Config) {
+    require_not_paused(&env).expect("contract paused");
     require_admin_approval(&env, &admin_signers);
-    validate_admin_config(&env, &config.admins, config.admin_threshold)
-        .expect("invalid admin config");
-    assert!(config.yield_bps >= 0, "yield_bps must be non-negative");
-    assert!(
-        config.slash_bps > 0 && config.slash_bps <= 10_000,
-        "slash_bps must be 1-10000"
-    );
-    assert!(
-        config.max_vouchers > 0,
-        "max_vouchers must be greater than zero"
-    );
-    assert!(
-        config.min_loan_amount > 0,
-        "min_loan_amount must be greater than zero"
-    );
-    assert!(
-        config.loan_duration > 0,
-        "loan_duration must be greater than zero"
-    );
-    assert!(
-        config.max_loan_to_stake_ratio > 0,
-        "max_loan_to_stake_ratio must be greater than zero"
-    );
+    validate_admin_config(
+        &env,
+        &config.admins,
+        config.admin_threshold,
+        &config.admin_whitelist,
+        &config.admin_blacklist,
+    )
+    .expect("invalid admin config");
+    if config.yield_bps < 0 || config.yield_bps > 10_000 {
+        panic_with_error!(&env, ContractError::InvalidBps);
+    }
+    if config.slash_bps <= 0 || config.slash_bps > 10_000 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.max_vouchers == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.min_loan_amount <= 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.loan_duration == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.grace_period > config.loan_duration {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.max_loan_to_stake_ratio == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.recovery_percentage > 10_000 {
+        panic_with_error!(&env, ContractError::InvalidBps);
+    }
     env.storage().instance().set(&DataKey::Config, &config);
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("config")),
@@ -194,20 +421,22 @@ pub fn update_config(
     yield_bps: Option<i128>,
     slash_bps: Option<i128>,
 ) {
+    require_not_paused(&env).expect("contract paused");
     require_admin_approval(&env, &admin_signers);
 
     let mut cfg = config(&env);
 
     if let Some(new_yield_bps) = yield_bps {
-        assert!(new_yield_bps >= 0, "yield_bps must be non-negative");
+        if new_yield_bps < 0 || new_yield_bps > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidBps);
+        }
         cfg.yield_bps = new_yield_bps;
     }
 
     if let Some(new_slash_bps) = slash_bps {
-        assert!(
-            new_slash_bps > 0 && new_slash_bps <= 10_000,
-            "slash_bps must be 1-10000"
-        );
+        if new_slash_bps <= 0 || new_slash_bps > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
         cfg.slash_bps = new_slash_bps;
     }
 
@@ -215,6 +444,155 @@ pub fn update_config(
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("upconfig")),
         (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+    );
+}
+
+/// Atomically batch-update multiple protocol config parameters in a single write.
+/// Each parameter is `Option`al — only `Some` fields are updated.
+/// Requires admin multi-sig approval.
+pub fn batch_update_config(
+    env: Env,
+    admin_signers: Vec<Address>,
+    yield_bps: Option<i128>,
+    slash_bps: Option<i128>,
+    max_vouchers: Option<u32>,
+    min_loan_amount: Option<i128>,
+    loan_duration: Option<u64>,
+    max_loan_to_stake_ratio: Option<u32>,
+    grace_period: Option<u64>,
+    liquidity_mining_rate_bps: Option<u32>,
+) {
+    require_not_paused(&env).expect("contract paused");
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if let Some(v) = yield_bps {
+        if v < 0 || v > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidBps);
+        }
+        cfg.yield_bps = v;
+    }
+    if let Some(v) = slash_bps {
+        if v <= 0 || v > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.slash_bps = v;
+    }
+    if let Some(v) = max_vouchers {
+        if v == 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.max_vouchers = v;
+    }
+    if let Some(v) = min_loan_amount {
+        if v <= 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.min_loan_amount = v;
+    }
+    if let Some(v) = loan_duration {
+        if v == 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.loan_duration = v;
+    }
+    if let Some(v) = max_loan_to_stake_ratio {
+        if v == 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.max_loan_to_stake_ratio = v;
+    }
+    if let Some(v) = grace_period {
+        if v > cfg.loan_duration {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.grace_period = v;
+    }
+    if let Some(v) = liquidity_mining_rate_bps {
+        if v > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidBps);
+        }
+        cfg.liquidity_mining_rate_bps = v;
+    }
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("batch_cfg")),
+        (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+    );
+}
+
+/// Toggle dynamic slash threshold on/off.
+/// When enabled, slash penalties adjust based on protocol health.
+/// When disabled, uses static slash_bps from Config.
+pub fn set_dynamic_slash_threshold(
+    env: Env,
+    admin_signers: Vec<Address>,
+    enabled: bool,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.dynamic_slash_threshold = enabled;
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("dynslash")),
+        (admin_signers.get(0).unwrap(), enabled, env.ledger().timestamp()),
+    );
+}
+
+/// Get the current effective slash threshold (either static or dynamic).
+/// This function can be called by anyone to see what slash rate would be applied.
+pub fn get_effective_slash_threshold(env: Env) -> i128 {
+    crate::helpers::calculate_dynamic_slash_threshold(&env)
+}
+
+/// Toggle loan-size-based slash scaling on/off.
+/// When enabled, the slash percentage scales linearly with loan size relative to
+/// total staked collateral: small loans use `slash_bps`, large loans scale up to
+/// `loan_size_slash_max_bps`.
+pub fn set_loan_size_slash_enabled(
+    env: Env,
+    admin_signers: Vec<Address>,
+    enabled: bool,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.loan_size_slash_enabled = enabled;
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("lsslash")),
+        (admin_signers.get(0).unwrap(), enabled, env.ledger().timestamp()),
+    );
+}
+
+/// Set the maximum slash rate applied to the largest loans when loan-size scaling is enabled.
+/// Must be >= the current slash_bps and <= 10_000 (100%).
+pub fn set_loan_size_slash_max_bps(
+    env: Env,
+    admin_signers: Vec<Address>,
+    max_bps: i128,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let cfg = config(&env);
+    assert!(
+        max_bps >= cfg.slash_bps,
+        "loan_size_slash_max_bps must be >= slash_bps"
+    );
+    assert!(max_bps <= 10_000, "loan_size_slash_max_bps cannot exceed 100%");
+
+    let mut updated = cfg;
+    updated.loan_size_slash_max_bps = max_bps;
+
+    env.storage().instance().set(&DataKey::Config, &updated);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("lsmaxbps")),
+        (admin_signers.get(0).unwrap(), max_bps, env.ledger().timestamp()),
     );
 }
 
@@ -233,9 +611,18 @@ pub fn set_reputation_nft(env: Env, admin_signers: Vec<Address>, nft_contract: A
     );
 }
 
+/// Set the minimum allowed vouch stake.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `admin_signers` - Admin addresses authorizing this call (must meet threshold)
+/// * `amount` - Minimum stake amount, in stroops (0 disables the minimum check).
+///   1 XLM = 10,000,000 stroops.
 pub fn set_min_stake(env: Env, admin_signers: Vec<Address>, amount: i128) {
     require_admin_approval(&env, &admin_signers);
-    assert!(amount >= 0, "min stake cannot be negative");
+    if amount < 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
     env.storage().instance().set(&DataKey::MinStake, &amount);
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("minstake")),
@@ -247,9 +634,18 @@ pub fn set_min_stake(env: Env, admin_signers: Vec<Address>, amount: i128) {
     );
 }
 
+/// Set the maximum loan amount allowed per loan request.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `admin_signers` - Admin addresses authorizing this call (must meet threshold)
+/// * `amount` - Maximum loan amount, in stroops (0 = no cap enforced).
+///   1 XLM = 10,000,000 stroops.
 pub fn set_max_loan_amount(env: Env, admin_signers: Vec<Address>, amount: i128) {
     require_admin_approval(&env, &admin_signers);
-    assert!(amount >= 0, "max loan amount cannot be negative");
+    if amount < 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
     env.storage()
         .instance()
         .set(&DataKey::MaxLoanAmount, &amount);
@@ -278,12 +674,22 @@ pub fn set_min_vouchers(env: Env, admin_signers: Vec<Address>, count: u32) {
 
 pub fn set_max_loan_to_stake_ratio(env: Env, admin_signers: Vec<Address>, ratio: u32) {
     require_admin_approval(&env, &admin_signers);
-    assert!(
-        ratio > 0,
-        "max_loan_to_stake_ratio must be greater than zero"
-    );
+    if ratio == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
     let mut cfg = config(&env);
     cfg.max_loan_to_stake_ratio = ratio;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+}
+
+pub fn set_grace_period(env: Env, admin_signers: Vec<Address>, period: u64) {
+    require_admin_approval(&env, &admin_signers);
+    let cfg = config(&env);
+    if period > cfg.loan_duration {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    let mut cfg = cfg;
+    cfg.grace_period = period;
     env.storage().instance().set(&DataKey::Config, &cfg);
 }
 
@@ -335,15 +741,16 @@ pub fn get_config(env: Env) -> Config {
     config(&env)
 }
 
-pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) -> Result<(), ContractError> {
     require_admin_approval(&env, &admin_signers);
+    require_valid_token(&env, &token)?;
     let mut cfg = config(&env);
-    assert!(
-        !cfg.allowed_tokens.iter().any(|t| t == token) && token != cfg.token,
-        "token already allowed"
-    );
+    if cfg.allowed_tokens.iter().any(|t| t == token) || token == cfg.token {
+        return Err(ContractError::DuplicateToken);
+    }
     cfg.allowed_tokens.push_back(token);
     env.storage().instance().set(&DataKey::Config, &cfg);
+    Ok(())
 }
 
 pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
@@ -359,7 +766,7 @@ pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Addres
 }
 
 pub fn get_admins(env: Env) -> Vec<Address> {
-    config(&env).admins
+    crate::helpers::get_admins(&env)
 }
 
 pub fn get_admin_threshold(env: Env) -> u32 {
@@ -371,4 +778,1347 @@ pub fn is_whitelisted(env: Env, voucher: Address) -> bool {
         .persistent()
         .get(&DataKey::VoucherWhitelist(voucher))
         .unwrap_or(false)
+}
+
+pub fn is_whitelist_enabled(env: Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::WhitelistEnabled)
+        .unwrap_or(false)
+}
+
+pub fn set_max_vouchers_per_borrower(env: Env, admin_signers: Vec<Address>, max_vouchers: u32) {
+    require_admin_approval(&env, &admin_signers);
+    if max_vouchers == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::MaxVouchersPerBorrower, &max_vouchers);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("maxvchbr")),
+        (
+            admin_signers.get(0).unwrap(),
+            max_vouchers,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+pub fn get_max_vouchers_per_borrower(env: Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxVouchersPerBorrower)
+        .unwrap_or(crate::types::DEFAULT_MAX_VOUCHERS_PER_BORROWER)
+}
+
+pub fn withdraw_slash_treasury(
+    env: Env,
+    admin_signers: Vec<Address>,
+    recipient: Address,
+    amount: i128,
+) {
+    require_admin_approval(&env, &admin_signers);
+    assert!(amount > 0, "amount must be greater than zero");
+
+    let balance: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashTreasury)
+        .unwrap_or(0);
+    assert!(balance >= amount, "insufficient slash treasury balance");
+
+    env.storage()
+        .instance()
+        .set(&DataKey::SlashTreasury, &(balance - amount));
+
+    let cfg = config(&env);
+    soroban_sdk::token::Client::new(&env, &cfg.token)
+        .transfer(&env.current_contract_address(), &recipient, &amount);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("slshwdraw")),
+        (admin_signers.get(0).unwrap(), recipient, amount),
+    );
+}
+
+pub fn propose_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+
+    if new_admin == Address::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF") {
+        return Err(ContractError::ZeroAddress);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAdmin, &new_admin);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("proposed")),
+        new_admin,
+    );
+
+    Ok(())
+}
+
+pub fn accept_admin(env: Env) -> Result<(), ContractError> {
+    let new_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::PendingAdmin)
+        .ok_or(ContractError::UnauthorizedCaller)?;
+
+    new_admin.require_auth();
+
+    let mut cfg = config(&env);
+    cfg.admins.push_back(new_admin.clone());
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    // Clear the pending admin
+    env.storage().instance().remove(&DataKey::PendingAdmin);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("accepted")),
+        new_admin,
+    );
+
+    Ok(())
+}
+
+/// Designate a successor admin who can claim admin rights without multi-sig approval.
+/// Only the current admin set can designate a successor. Pass `None` to clear.
+pub fn set_successor_admin(
+    env: Env,
+    admin_signers: Vec<Address>,
+    successor: Option<Address>,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    if let Some(ref addr) = successor {
+        if is_admin(&env, addr) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+    }
+
+    let mut cfg = config(&env);
+    cfg.successor_admin = successor.clone();
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("successor")),
+        (admin_signers.get(0).unwrap(), successor),
+    );
+}
+
+/// Claim admin rights as the designated successor admin.
+/// The caller must match the stored `successor_admin` address and authenticate.
+/// On success, the caller is added to the admin list and the successor slot is cleared.
+pub fn claim_successor_admin(env: Env) -> Result<(), ContractError> {
+    let mut cfg = config(&env);
+    let successor = cfg
+        .successor_admin
+        .clone()
+        .ok_or(ContractError::UnauthorizedCaller)?;
+
+    successor.require_auth();
+
+    cfg.admins.push_back(successor.clone());
+    cfg.successor_admin = None;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cl_succ")),
+        successor,
+    );
+
+    Ok(())
+}
+
+pub fn set_prepayment_penalty_bps(env: Env, admin_signers: Vec<Address>, penalty_bps: u32) {
+    require_admin_approval(&env, &admin_signers);
+    assert!(penalty_bps <= 10_000, "penalty_bps must not exceed 10000");
+    env.storage()
+        .instance()
+        .set(&DataKey::PrepaymentPenaltyBps, &penalty_bps);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("prepay")),
+        (admin_signers.get(0).unwrap(), penalty_bps),
+    );
+}
+
+pub fn get_prepayment_penalty_bps(env: Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PrepaymentPenaltyBps)
+        .unwrap_or(0)
+}
+
+/// Issue #554: Propose an admin action (e.g., pause, slash, config change).
+pub fn propose_admin_action(
+    env: Env,
+    proposer: Address,
+    action_type: soroban_sdk::String,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+
+    let action_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminActionCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("action ID overflow");
+
+    let proposal = AdminActionProposal {
+        id: action_id,
+        action_type,
+        proposer: proposer.clone(),
+        approvals: Vec::new(&env),
+        created_at: env.ledger().timestamp(),
+        executed: false,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminAction(action_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminActionCounter, &action_id);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("propose")),
+        (action_id, proposer),
+    );
+
+    Ok(action_id)
+}
+
+/// Issue #554: Approve an admin action. Requires admin signature.
+pub fn approve_admin_action(
+    env: Env,
+    admin: Address,
+    action_id: u64,
+) -> Result<(), ContractError> {
+    admin.require_auth();
+
+    let cfg = config(&env);
+    if !cfg.admins.iter().any(|a| a == admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let mut proposal: AdminActionProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminAction(action_id))
+        .ok_or(ContractError::NoActiveLoan)?;
+
+    if proposal.executed {
+        return Err(ContractError::SlashAlreadyExecuted);
+    }
+
+    // Prevent double-approval
+    if proposal.approvals.iter().any(|a| a == admin) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    proposal.approvals.push_back(admin.clone());
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminAction(action_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("approve")),
+        (action_id, admin),
+    );
+
+    Ok(())
+}
+
+/// Issue #554: Execute an admin action if threshold is met.
+pub fn execute_admin_action(env: Env, action_id: u64) -> Result<(), ContractError> {
+    let mut proposal: AdminActionProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminAction(action_id))
+        .ok_or(ContractError::NoActiveLoan)?;
+
+    if proposal.executed {
+        return Err(ContractError::SlashAlreadyExecuted);
+    }
+
+    let cfg = config(&env);
+    if proposal.approvals.len() < cfg.admin_threshold {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    proposal.executed = true;
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminAction(action_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("execute")),
+        (action_id, proposal.action_type.clone()),
+    );
+
+    Ok(())
+}
+
+// ── Issue #682: Multi-sig config update proposals ─────────────────────────────
+
+pub fn propose_config_update(
+    env: Env,
+    proposer: Address,
+    key: ConfigUpdateKey,
+    new_value: u32,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+
+    if !is_admin(&env, &proposer) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    if matches!(key, ConfigUpdateKey::AdminThreshold) {
+        let cfg = config(&env);
+        if new_value == 0 || new_value > cfg.admins.len() {
+            return Err(ContractError::InvalidAdminThreshold);
+        }
+    }
+
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::ConfigUpdateProposalCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal id overflow");
+
+    let proposal = ConfigUpdateProposal {
+        id: proposal_id,
+        proposer: proposer.clone(),
+        key,
+        new_value,
+        approvals: Vec::new(&env),
+        executed: false,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::ConfigUpdateProposal(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::ConfigUpdateProposalCounter, &proposal_id);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cfg_prop")),
+        (proposal_id, proposer),
+    );
+
+    Ok(proposal_id)
+}
+
+pub fn approve_config_update(
+    env: Env,
+    admin: Address,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    admin.require_auth();
+    require_not_paused(&env)?;
+
+    if !is_admin(&env, &admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let mut proposal: ConfigUpdateProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::ConfigUpdateProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.executed {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+
+    if proposal.approvals.iter().any(|a| a == admin) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    proposal.approvals.push_back(admin.clone());
+    env.storage()
+        .instance()
+        .set(&DataKey::ConfigUpdateProposal(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cfg_appr")),
+        (proposal_id, admin),
+    );
+
+    Ok(())
+}
+
+pub fn finalize_config_update(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+
+    let mut proposal: ConfigUpdateProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::ConfigUpdateProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.executed {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+
+    let cfg = config(&env);
+    if proposal.approvals.len() < cfg.admin_threshold {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let mut cfg = cfg;
+    match proposal.key {
+        ConfigUpdateKey::AdminThreshold => {
+            cfg.admin_threshold = proposal.new_value;
+        }
+    }
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    proposal.executed = true;
+    env.storage()
+        .instance()
+        .set(&DataKey::ConfigUpdateProposal(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cfg_fin")),
+        proposal_id,
+    );
+
+    Ok(())
+}
+
+pub fn get_config_update_proposal(env: Env, proposal_id: u64) -> Option<ConfigUpdateProposal> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ConfigUpdateProposal(proposal_id))
+}
+
+// ── Issue #683: Emergency pause ───────────────────────────────────────────────
+
+pub fn emergency_pause(env: Env, admin: Address) -> Result<(), ContractError> {
+    admin.require_auth();
+
+    if !is_admin(&env, &admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let mut cfg = config(&env);
+    cfg.emergency_pause_enabled = true;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("em_pause")),
+        admin,
+    );
+
+    Ok(())
+}
+
+pub fn emergency_unpause(env: Env, admin_signers: Vec<Address>) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.emergency_pause_enabled = false;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("em_unpa")),
+        admin_signers.get(0).unwrap(),
+    );
+
+    Ok(())
+}
+
+/// Toggle the borrower repayment confirmation requirement on/off.
+/// When enabled, borrowers must call `confirm_repayment` before `repay`.
+/// When disabled (default), `repay` works without any prior confirmation.
+pub fn set_confirmation_required(
+    env: Env,
+    admin_signers: Vec<Address>,
+    enabled: bool,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.confirmation_required = enabled;
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cnf_req")),
+        (admin_signers.get(0).unwrap(), enabled, env.ledger().timestamp()),
+    );
+}
+
+// ── Issue #686: Admin compensation ───────────────────────────────────────────
+
+/// Set the admin compensation rate.
+///
+/// `compensation_bps` is the fraction of the admin compensation pool that is
+/// distributed across all admins each time `claim_admin_compensation` is called.
+/// Must be in range [0, 10000]. 0 disables compensation.
+pub fn set_admin_compensation_bps(
+    env: Env,
+    admin_signers: Vec<Address>,
+    compensation_bps: u32,
+) {
+    require_admin_approval(&env, &admin_signers);
+    if compensation_bps > 10_000 {
+        panic_with_error!(&env, ContractError::InvalidBps);
+    }
+
+    let mut cfg = config(&env);
+    cfg.admin_compensation_bps = compensation_bps;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cmp_bps")),
+        (admin_signers.get(0).unwrap(), compensation_bps, env.ledger().timestamp()),
+    );
+}
+
+/// Add funds to the admin compensation pool.
+///
+/// Anyone may call this to top up the pool (e.g. from protocol revenues).
+/// The caller must hold at least `amount` tokens and authorize the transfer.
+pub fn fund_admin_compensation(
+    env: Env,
+    funder: Address,
+    amount: i128,
+) -> Result<(), ContractError> {
+    funder.require_auth();
+    if amount <= 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+
+    let cfg = config(&env);
+    soroban_sdk::token::Client::new(&env, &cfg.token)
+        .transfer(&funder, &env.current_contract_address(), &amount);
+
+    let pool: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminCompensation)
+        .unwrap_or(0i128);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminCompensation, &(pool + amount));
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cmp_fund")),
+        (funder, amount, env.ledger().timestamp()),
+    );
+
+    Ok(())
+}
+
+/// Claim admin compensation.
+///
+/// Each admin receives an equal pro-rata share of
+/// `pool_balance * admin_compensation_bps / 10_000` split across all admins.
+/// No more than once per 24 hours per admin (enforced via `AdminLastClaim`).
+pub fn claim_admin_compensation(env: Env, admin: Address) -> Result<i128, ContractError> {
+    admin.require_auth();
+
+    if !is_admin(&env, &admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let cfg = config(&env);
+    if cfg.admin_compensation_bps == 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let now = env.ledger().timestamp();
+    if let Some(last_claim) = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::AdminLastClaim(admin.clone()))
+    {
+        if now.saturating_sub(last_claim) < 24 * 60 * 60 {
+            return Err(ContractError::VouchCooldownActive);
+        }
+    }
+
+    let pool: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminCompensation)
+        .unwrap_or(0i128);
+
+    if pool == 0 {
+        return Err(ContractError::InsufficientFunds);
+    }
+
+    let num_admins = cfg.admins.len() as i128;
+    let total_payout = pool * cfg.admin_compensation_bps as i128 / 10_000;
+    let share = total_payout / num_admins;
+
+    if share <= 0 {
+        return Err(ContractError::InsufficientFunds);
+    }
+
+    let new_pool = pool - share;
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminCompensation, &new_pool);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminLastClaim(admin.clone()), &now);
+
+    soroban_sdk::token::Client::new(&env, &cfg.token)
+        .transfer(&env.current_contract_address(), &admin, &share);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("cmp_clm")),
+        (admin, share, env.ledger().timestamp()),
+    );
+
+    Ok(share)
+}
+
+/// Return the current admin compensation rate in basis points.
+pub fn get_admin_compensation_bps(env: Env) -> u32 {
+    config(&env).admin_compensation_bps
+}
+
+/// Return the current balance of the admin compensation pool, in stroops.
+pub fn get_admin_compensation_pool(env: Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminCompensation)
+        .unwrap_or(0i128)
+}
+
+/// Set the governance removal vote threshold for admin removal (#687).
+pub fn set_removal_vote_threshold(
+    env: Env,
+    admin_signers: Vec<Address>,
+    threshold: u32,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+    cfg.removal_vote_threshold = threshold;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("rmv_thr")),
+        (admin_signers.get(0).unwrap(), threshold, env.ledger().timestamp()),
+    );
+}
+
+pub fn set_rate_limit_config(
+    env: Env,
+    admin_signers: Vec<Address>,
+    rate_limit_config: crate::types::RateLimitConfig,
+) {
+    require_admin_approval(&env, &admin_signers);
+    let mut cfg = config(&env);
+    cfg.rate_limit_config = rate_limit_config;
+    env.storage().instance().set(&DataKey::Config, &cfg);
+}
+
+pub fn set_role_permissions(
+    env: Env,
+    admin_signers: Vec<Address>,
+    account: Address,
+    permissions: crate::types::RolePermissions,
+) {
+    require_admin_approval(&env, &admin_signers);
+    env.storage()
+        .persistent()
+        .set(&DataKey::RolePermissions(account), &permissions);
+}
+
+// ── Admin Governance Queue with Multi-Signature Confirmation ─────────────────────
+
+/// Get the governance queue configuration, or default if not set.
+fn get_governance_queue_config(env: &Env) -> GovernanceQueueConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::GovernanceQueueConfig)
+        .unwrap_or(GovernanceQueueConfig {
+            timelock_delay: DEFAULT_GOVERNANCE_TIMELOCK_DELAY,
+            execution_window: DEFAULT_GOVERNANCE_EXECUTION_WINDOW,
+            require_multisig: true,
+        })
+}
+
+/// Set the governance queue configuration.
+/// Requires admin approval.
+pub fn set_governance_queue_config(
+    env: Env,
+    admin_signers: Vec<Address>,
+    config: GovernanceQueueConfig,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    if config.timelock_delay == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+    if config.execution_window == 0 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceQueueConfig, &config);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("queue_cfg")),
+        (admin_signers.get(0).unwrap(), config.timelock_delay, config.execution_window),
+    );
+}
+
+/// Propose a governance action to the admin governance queue.
+/// The proposal will require multi-signature approval before execution.
+/// A timelock delay is applied before the proposal can be executed.
+pub fn propose_governance_action(
+    env: Env,
+    proposer: Address,
+    action: GovernanceAction,
+    description: soroban_sdk::String,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+
+    // Check if proposer is an admin
+    if !is_admin(&env, &proposer) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let queue_config = get_governance_queue_config(&env);
+    let now = env.ledger().timestamp();
+
+    // Generate proposal ID
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::GovernanceProposalCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal ID overflow");
+
+    // Calculate timelock and expiry
+    let executable_at = now + queue_config.timelock_delay;
+    let expires_at = executable_at + queue_config.execution_window;
+
+    // Create proposal
+    let proposal = GovernanceProposal {
+        id: proposal_id,
+        action: action.clone(),
+        proposer: proposer.clone(),
+        approvals: Vec::new(&env),
+        rejections: Vec::new(&env),
+        status: GovernanceProposalStatus::Pending,
+        created_at: now,
+        executable_at,
+        expires_at,
+        description: description.clone(),
+        executed_at: None,
+    };
+
+    // Store proposal
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceProposalCounter, &proposal_id);
+
+    // Publish event
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("propose")),
+        (proposal_id, proposer, action, executable_at),
+    );
+
+    Ok(proposal_id)
+}
+
+/// Approve a governance proposal.
+/// Only admins can approve proposals.
+/// Once the approval threshold is met, the proposal status changes to Approved.
+pub fn approve_governance_action(
+    env: Env,
+    admin: Address,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    admin.require_auth();
+
+    // Check if caller is an admin
+    if !is_admin(&env, &admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let mut proposal: GovernanceProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::GovernanceProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    // Check proposal status
+    if proposal.status == GovernanceProposalStatus::Executed {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Cancelled {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Expired {
+        return Err(ContractError::ProposalExpired);
+    }
+
+    // Check if already approved
+    if proposal.approvals.iter().any(|a| a == admin) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    // Check if already rejected
+    if proposal.rejections.iter().any(|a| a == admin) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    // Add approval
+    proposal.approvals.push_back(admin.clone());
+
+    // Check if threshold is met
+    let cfg = config(&env);
+    let queue_config = get_governance_queue_config(&env);
+
+    if queue_config.require_multisig {
+        if proposal.approvals.len() >= cfg.admin_threshold {
+            proposal.status = GovernanceProposalStatus::Approved;
+        }
+    } else {
+        // If multisig not required, single approval is enough
+        proposal.status = GovernanceProposalStatus::Approved;
+    }
+
+    // Store updated proposal
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+
+    // Publish event
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("approve")),
+        (proposal_id, admin, proposal.approvals.len()),
+    );
+
+    Ok(())
+}
+
+/// Reject a governance proposal.
+/// Only admins can reject proposals.
+/// If rejection threshold is met, the proposal is cancelled.
+pub fn reject_governance_action(
+    env: Env,
+    admin: Address,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    admin.require_auth();
+
+    // Check if caller is an admin
+    if !is_admin(&env, &admin) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let mut proposal: GovernanceProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::GovernanceProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    // Check proposal status
+    if proposal.status == GovernanceProposalStatus::Executed {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Cancelled {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Expired {
+        return Err(ContractError::ProposalExpired);
+    }
+
+    // Check if already approved
+    if proposal.approvals.iter().any(|a| a == admin) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    // Check if already rejected
+    if proposal.rejections.iter().any(|a| a == admin) {
+        return Err(ContractError::AlreadyVoted);
+    }
+
+    // Add rejection
+    proposal.rejections.push_back(admin.clone());
+
+    // If rejections reach threshold, cancel the proposal
+    let cfg = config(&env);
+    if proposal.rejections.len() >= cfg.admin_threshold {
+        proposal.status = GovernanceProposalStatus::Cancelled;
+    }
+
+    // Store updated proposal
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+
+    // Publish event
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("reject")),
+        (proposal_id, admin, proposal.rejections.len()),
+    );
+
+    Ok(())
+}
+
+/// Execute a governance proposal.
+/// The proposal must be in Approved status and the timelock delay must have elapsed.
+/// Anyone can call this function once the conditions are met.
+pub fn execute_governance_action(
+    env: Env,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    let mut proposal: GovernanceProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::GovernanceProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    // Check proposal status
+    if proposal.status == GovernanceProposalStatus::Executed {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Cancelled {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Expired {
+        return Err(ContractError::ProposalExpired);
+    }
+    if proposal.status != GovernanceProposalStatus::Approved {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    let now = env.ledger().timestamp();
+
+    // Check timelock delay
+    if now < proposal.executable_at {
+        return Err(ContractError::TimelockDelayNotElapsed);
+    }
+
+    // Check execution window
+    if now > proposal.expires_at {
+        proposal.status = GovernanceProposalStatus::Expired;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+        return Err(ContractError::ExecutionWindowPassed);
+    }
+
+    // Execute the action
+    execute_governance_action_internal(&env, &proposal.action)?;
+
+    // Mark as executed
+    proposal.status = GovernanceProposalStatus::Executed;
+    proposal.executed_at = Some(now);
+
+    // Store updated proposal
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+
+    // Publish event
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("execute")),
+        (proposal_id, proposal.action, now),
+    );
+
+    Ok(())
+}
+
+/// Internal function to execute a governance action.
+fn execute_governance_action_internal(
+    env: &Env,
+    action: &GovernanceAction,
+) -> Result<(), ContractError> {
+    match action {
+        GovernanceAction::Pause => {
+            env.storage().instance().set(&DataKey::Paused, &true);
+            env.storage()
+                .instance()
+                .set(&DataKey::PauseMode, &crate::types::PauseMode::Paused);
+        }
+        GovernanceAction::Unpause => {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            env.storage()
+                .instance()
+                .set(&DataKey::PauseMode, &crate::types::PauseMode::None);
+            env.storage().instance().remove(&DataKey::ThawState);
+        }
+        GovernanceAction::Upgrade(new_wasm_hash) => {
+            env.deployer()
+                .update_current_contract_wasm(new_wasm_hash.clone());
+        }
+        GovernanceAction::SetProtocolFee(fee_bps) => {
+            if *fee_bps > 10_000 {
+                return Err(ContractError::InvalidAmount);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::ProtocolFeeBps, fee_bps);
+        }
+        GovernanceAction::SetFeeTreasury(treasury) => {
+            env.storage()
+                .instance()
+                .set(&DataKey::FeeTreasury, treasury);
+        }
+        GovernanceAction::AddAllowedToken(token) => {
+            let mut cfg = config(env);
+            if cfg.allowed_tokens.iter().any(|t| t == *token) || *token == cfg.token {
+                return Err(ContractError::DuplicateToken);
+            }
+            cfg.allowed_tokens.push_back(token.clone());
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::RemoveAllowedToken(token) => {
+            let mut cfg = config(env);
+            let idx = cfg
+                .allowed_tokens
+                .iter()
+                .position(|t| t == *token)
+                .expect("token not in allowed list") as u32;
+            cfg.allowed_tokens.remove(idx);
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetMinStake(amount) => {
+            if *amount < 0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            env.storage().instance().set(&DataKey::MinStake, amount);
+        }
+        GovernanceAction::SetMaxLoanAmount(amount) => {
+            if *amount < 0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxLoanAmount, amount);
+        }
+        GovernanceAction::SetMinVouchers(count) => {
+            env.storage().instance().set(&DataKey::MinVouchers, count);
+        }
+        GovernanceAction::SetMaxVouchersPerBorrower(count) => {
+            if *count == 0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxVouchersPerBorrower, count);
+        }
+        GovernanceAction::SetMaxLoanToStakeRatio(ratio) => {
+            if *ratio == 0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            let mut cfg = config(env);
+            cfg.max_loan_to_stake_ratio = *ratio;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetGracePeriod(period) => {
+            let cfg = config(env);
+            if *period > cfg.loan_duration {
+                return Err(ContractError::InvalidAmount);
+            }
+            let mut cfg = cfg;
+            cfg.grace_period = *period;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetYieldBps(yield_bps) => {
+            if *yield_bps < 0 || *yield_bps > 10_000 {
+                return Err(ContractError::InvalidBps);
+            }
+            let mut cfg = config(env);
+            cfg.yield_bps = *yield_bps;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetSlashBps(slash_bps) => {
+            if *slash_bps <= 0 || *slash_bps > 10_000 {
+                return Err(ContractError::InvalidAmount);
+            }
+            let mut cfg = config(env);
+            cfg.slash_bps = *slash_bps;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetAdminThreshold(threshold) => {
+            let cfg = config(env);
+            if *threshold == 0 || *threshold > cfg.admins.len() {
+                return Err(ContractError::InvalidAdminThreshold);
+            }
+            let mut cfg = cfg;
+            cfg.admin_threshold = *threshold;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::AddAdmin(new_admin) => {
+            let mut cfg = config(env);
+            validate_admin_member(env, new_admin, &cfg);
+            if cfg.admins.iter().any(|a| a == *new_admin) {
+                return Err(ContractError::AlreadyInitialized);
+            }
+            cfg.admins.push_back(new_admin.clone());
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::RemoveAdmin(admin_to_remove) => {
+            let mut cfg = config(env);
+            let idx = cfg
+                .admins
+                .iter()
+                .position(|a| a == *admin_to_remove)
+                .expect("address is not an admin") as u32;
+            cfg.admins.remove(idx);
+            if cfg.admins.is_empty() {
+                return Err(ContractError::UnauthorizedCaller);
+            }
+            if cfg.admin_threshold > cfg.admins.len() {
+                return Err(ContractError::InvalidAdminThreshold);
+            }
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::RotateAdmin(old_admin, new_admin) => {
+            let mut cfg = config(env);
+            if old_admin == new_admin {
+                return Err(ContractError::InvalidAmount);
+            }
+            validate_admin_member(env, new_admin, &cfg);
+            if cfg.admins.iter().any(|a| a == *new_admin) {
+                return Err(ContractError::AlreadyInitialized);
+            }
+            let idx = cfg
+                .admins
+                .iter()
+                .position(|a| a == *old_admin)
+                .expect("old admin not found") as u32;
+            cfg.admins.set(idx, new_admin.clone());
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetReputationNft(nft_contract) => {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReputationNft, nft_contract);
+        }
+        GovernanceAction::SetWhitelistEnabled(enabled) => {
+            env.storage()
+                .instance()
+                .set(&DataKey::WhitelistEnabled, enabled);
+        }
+        GovernanceAction::BlacklistBorrower(borrower) => {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Blacklisted(borrower.clone()), &true);
+        }
+        GovernanceAction::SetPrepaymentPenaltyBps(penalty_bps) => {
+            if *penalty_bps > 10_000 {
+                return Err(ContractError::InvalidAmount);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::PrepaymentPenaltyBps, penalty_bps);
+        }
+        GovernanceAction::SetDynamicSlashThreshold(enabled) => {
+            let mut cfg = config(env);
+            cfg.dynamic_slash_threshold = *enabled;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetLoanSizeSlashEnabled(enabled) => {
+            let mut cfg = config(env);
+            cfg.loan_size_slash_enabled = *enabled;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetLoanSizeSlashMaxBps(max_bps) => {
+            let cfg = config(env);
+            assert!(
+                *max_bps >= cfg.slash_bps,
+                "loan_size_slash_max_bps must be >= slash_bps"
+            );
+            assert!(
+                *max_bps <= 10_000,
+                "loan_size_slash_max_bps cannot exceed 100%"
+            );
+            let mut updated = cfg;
+            updated.loan_size_slash_max_bps = *max_bps;
+            env.storage().instance().set(&DataKey::Config, &updated);
+        }
+        GovernanceAction::SetSuccessorAdmin(successor) => {
+            let mut cfg = config(env);
+            if let Some(ref addr) = successor {
+                if is_admin(env, addr) {
+                    return Err(ContractError::AlreadyInitialized);
+                }
+            }
+            cfg.successor_admin = successor.clone();
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetConfirmationRequired(enabled) => {
+            let mut cfg = config(env);
+            cfg.confirmation_required = *enabled;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetAdminCompensationBps(compensation_bps) => {
+            if *compensation_bps > 10_000 {
+                return Err(ContractError::InvalidBps);
+            }
+            let mut cfg = config(env);
+            cfg.admin_compensation_bps = *compensation_bps;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetRemovalVoteThreshold(threshold) => {
+            let mut cfg = config(env);
+            cfg.removal_vote_threshold = *threshold;
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+        GovernanceAction::SetRateLimitConfig(rate_limit_config) => {
+            let mut cfg = config(env);
+            cfg.rate_limit_config = rate_limit_config.clone();
+            env.storage().instance().set(&DataKey::Config, &cfg);
+        }
+    }
+
+    Ok(())
+}
+
+/// Cancel a governance proposal.
+/// Only the proposer or an admin can cancel a pending proposal.
+pub fn cancel_governance_action(
+    env: Env,
+    caller: Address,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    caller.require_auth();
+
+    let mut proposal: GovernanceProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::GovernanceProposal(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    // Check if caller is proposer or admin
+    let is_admin_caller = is_admin(&env, &caller);
+    if caller != proposal.proposer && !is_admin_caller {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    // Check proposal status
+    if proposal.status == GovernanceProposalStatus::Executed {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Cancelled {
+        return Err(ContractError::ProposalAlreadyFinalized);
+    }
+    if proposal.status == GovernanceProposalStatus::Expired {
+        return Err(ContractError::ProposalExpired);
+    }
+
+    // Cancel the proposal
+    proposal.status = GovernanceProposalStatus::Cancelled;
+
+    // Store updated proposal
+    env.storage()
+        .instance()
+        .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+
+    // Publish event
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("cancel")),
+        (proposal_id, caller),
+    );
+
+    Ok(())
+}
+
+/// Get a governance proposal by ID.
+pub fn get_governance_proposal(env: Env, proposal_id: u64) -> Option<GovernanceProposal> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GovernanceProposal(proposal_id))
+}
+
+/// Get the governance queue configuration.
+pub fn get_governance_queue_config_view(env: Env) -> GovernanceQueueConfig {
+    get_governance_queue_config(&env)
+}
+
+/// Get the total number of governance proposals created.
+pub fn get_governance_proposal_count(env: Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GovernanceProposalCounter)
+        .unwrap_or(0u64)
+}
+
+// ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────────
+
+/// Issue #893: Set multi-tier admin approval thresholds for different operation types.
+/// Allows different admin operations to require different numbers of approvals.
+pub fn set_multi_tier_thresholds(
+    env: Env,
+    admin_signers: Vec<Address>,
+    thresholds: MultiTierAdminThresholds,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    // Validate thresholds
+    let admin_count = config(&env).admins.len() as u32;
+    assert!(
+        thresholds.standard_threshold > 0 && thresholds.standard_threshold <= admin_count,
+        "invalid standard threshold"
+    );
+    assert!(
+        thresholds.high_risk_threshold > 0 && thresholds.high_risk_threshold <= admin_count,
+        "invalid high-risk threshold"
+    );
+    assert!(
+        thresholds.critical_threshold > 0 && thresholds.critical_threshold <= admin_count,
+        "invalid critical threshold"
+    );
+
+    env.storage()
+        .instance()
+        .set(&DataKey::MultiTierAdminThresholds, &thresholds);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("multi")),
+        (
+            thresholds.standard_threshold,
+            thresholds.high_risk_threshold,
+            thresholds.critical_threshold,
+        ),
+    );
+}
+
+/// Issue #893: Get the current multi-tier admin approval thresholds.
+pub fn get_multi_tier_thresholds(env: Env) -> Option<MultiTierAdminThresholds> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MultiTierAdminThresholds)
+}
+
+/// Issue #893: Get the effective threshold for a specific operation type.
+pub fn get_effective_approval_threshold(
+    env: Env,
+    operation_type: AdminOperationType,
+) -> u32 {
+    let cfg = config(&env);
+
+    if let Some(multi_tier) = cfg.multi_tier_thresholds {
+        multi_tier.get_threshold(operation_type)
+    } else {
+        cfg.admin_threshold
+    }
 }
