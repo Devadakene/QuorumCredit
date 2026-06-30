@@ -174,4 +174,10 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
+    /// Invalid zk-SNARK proof type.
+    InvalidProofType = 143,
+    /// zk-SNARK proof verification failed.
+    ProofVerificationFailed = 144,
+    /// Invalid confidential commitment.
+    InvalidCommitment = 145,
 }
