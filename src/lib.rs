@@ -2094,8 +2094,6 @@ impl QuorumCreditContract {
     ) -> VouchPage {
         admin::get_vouches_paginated(env, borrower, cursor, page_size)
     }
-}
-
     // ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────
 
     pub fn set_multi_tier_thresholds(
