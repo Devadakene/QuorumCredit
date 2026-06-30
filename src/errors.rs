@@ -174,4 +174,6 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
+/// Loan exceeds the maximum allowed loan-to-collateral ratio.
+LoanExceedsMaxRatio = 143,
 }

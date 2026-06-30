@@ -86,6 +86,8 @@ mod slash_vote_cancel_test;
 mod dynamic_quorum_adjustment_test;
 #[cfg(test)]
 mod conditional_vote_delegation_test;
+#[cfg(test)]
+mod ratio_enforcement_test;
 
 #[cfg(test)]
 mod risk_assessment_voting_test;
@@ -138,7 +140,7 @@ use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
     require_allowed_token, require_not_paused,
 };
-use crate::types::{AdminOperationType, Config, DataKey, MultiTierAdminThresholds, RateLimitConfig, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
+use crate::types::{AdminOperationType, Config, DataKey, MultiTierAdminThresholds, RateLimitConfig, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_LOAN_TO_COLLATERAL_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
 use soroban_sdk::BytesN;
 
 #[contract]
@@ -186,6 +188,7 @@ impl QuorumCreditContract {
                 min_loan_amount: DEFAULT_MIN_LOAN_AMOUNT,
                 loan_duration: DEFAULT_LOAN_DURATION,
                 max_loan_to_stake_ratio: DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
+                max_loan_to_collateral_ratio: DEFAULT_MAX_LOAN_TO_COLLATERAL_RATIO,
                 grace_period: 0,
                 min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
                 prepayment_penalty_bps: 0,
